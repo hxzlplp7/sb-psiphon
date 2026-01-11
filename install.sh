@@ -175,8 +175,8 @@ install_psiphon(){
   # 创建临时目录
   local tmpd
   tmpd="$(mktemp -d)"
-  # 使用 trap 确保退出时清理
-  trap 'rm -rf "$tmpd"' RETURN
+  # 使用 ${tmpd:-} 防止 set -u 报 unbound variable
+  trap '[[ -n "${tmpd:-}" && -d "${tmpd:-}" ]] && rm -rf -- "$tmpd"' RETURN
 
   local tag="${PSI_TAG_DEFAULT}"
   local base="https://github.com/${PSI_REPO_OWNER}/${PSI_REPO_NAME}/releases/download/${tag}"

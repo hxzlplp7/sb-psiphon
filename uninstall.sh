@@ -34,6 +34,7 @@ systemctl daemon-reload
 
 ylw "[*] 删除配置目录..."
 rm -rf /etc/psiphon
+rm -rf /etc/psiphon-egress  # 分享链接数据源
 rm -rf /etc/xray
 rm -rf /etc/hysteria
 rm -rf /etc/tuic

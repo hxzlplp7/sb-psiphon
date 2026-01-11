@@ -13,6 +13,15 @@ DEFAULT_PSIPHON_REGION="US"
 DEFAULT_PSIPHON_SOCKS="1081"
 DEFAULT_PSIPHON_HTTP="8081"
 
+# ========= 全局临时目录管理（防止 set -u 报 unbound variable）=========
+_tmpd=""
+_cleanup_tmpd() {
+  if [[ -n "${_tmpd:-}" && -d "${_tmpd:-}" ]]; then
+    rm -rf -- "$_tmpd"
+  fi
+}
+trap _cleanup_tmpd EXIT
+
 # ========= 工具函数 =========
 red(){ echo -e "\033[31m$*\033[0m" >&2; }
 grn(){ echo -e "\033[32m$*\033[0m" >&2; }
@@ -172,11 +181,8 @@ install_psiphon(){
     exit 1
   fi
 
-  # 创建临时目录
-  local tmpd
-  tmpd="$(mktemp -d)"
-  # 使用 ${tmpd:-} 防止 set -u 报 unbound variable
-  trap '[[ -n "${tmpd:-}" && -d "${tmpd:-}" ]] && rm -rf -- "$tmpd"' RETURN
+  # 创建临时目录（使用全局 _tmpd，由 EXIT trap 清理）
+  _tmpd="$(mktemp -d)"
 
   local tag="${PSI_TAG_DEFAULT}"
   local base="https://github.com/${PSI_REPO_OWNER}/${PSI_REPO_NAME}/releases/download/${tag}"
@@ -193,28 +199,28 @@ install_psiphon(){
     # 下载 tar.gz
     ylw "[*] 正在下载..."
     if command -v curl >/dev/null 2>&1; then
-      curl -fsSL "$url" -o "${tmpd}/${asset}"
+      curl -fsSL "$url" -o "${_tmpd}/${asset}"
     else
-      wget -qO "${tmpd}/${asset}" "$url"
+      wget -qO "${_tmpd}/${asset}" "$url"
     fi
 
     # 尝试下载并校验 SHA256
     if curl -fsI "$sha_url" >/dev/null 2>&1; then
       ylw "[*] 下载 SHA256 校验文件..."
       if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$sha_url" -o "${tmpd}/${asset}.sha256"
+        curl -fsSL "$sha_url" -o "${_tmpd}/${asset}.sha256"
       else
-        wget -qO "${tmpd}/${asset}.sha256" "$sha_url"
+        wget -qO "${_tmpd}/${asset}.sha256" "$sha_url"
       fi
 
       local expected actual
-      expected="$(grep -Eo '[0-9a-fA-F]{64}' "${tmpd}/${asset}.sha256" | head -n1 | tr '[:upper:]' '[:lower:]')"
+      expected="$(grep -Eo '[0-9a-fA-F]{64}' "${_tmpd}/${asset}.sha256" | head -n1 | tr '[:upper:]' '[:lower:]')"
 
       # 计算实际 SHA256（兼容 Linux 和 FreeBSD）
       if command -v sha256sum >/dev/null 2>&1; then
-        actual="$(sha256sum "${tmpd}/${asset}" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
+        actual="$(sha256sum "${_tmpd}/${asset}" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
       elif command -v shasum >/dev/null 2>&1; then
-        actual="$(shasum -a 256 "${tmpd}/${asset}" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
+        actual="$(shasum -a 256 "${_tmpd}/${asset}" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
       else
         ylw "[!] 未找到 sha256sum/shasum，跳过校验"
         expected=""
@@ -236,15 +242,15 @@ install_psiphon(){
 
     # 解压
     ylw "[*] 解压中..."
-    tar -xzf "${tmpd}/${asset}" -C "$tmpd"
+    tar -xzf "${_tmpd}/${asset}" -C "$_tmpd"
 
     # 查找解压后的二进制文件
     local extracted=""
-    if [[ -f "${tmpd}/psiphon-tunnel-core" ]]; then
-      extracted="${tmpd}/psiphon-tunnel-core"
+    if [[ -f "${_tmpd}/psiphon-tunnel-core" ]]; then
+      extracted="${_tmpd}/psiphon-tunnel-core"
     else
       # 兼容 tar 包里二进制名不固定的情况
-      extracted="$(find "$tmpd" -maxdepth 2 -type f -name 'psiphon-tunnel-core*' ! -name '*.tar.gz' ! -name '*.sha256' | head -n1)"
+      extracted="$(find "$_tmpd" -maxdepth 2 -type f -name 'psiphon-tunnel-core*' ! -name '*.tar.gz' ! -name '*.sha256' | head -n1)"
     fi
 
     if [[ -z "$extracted" || ! -f "$extracted" ]]; then

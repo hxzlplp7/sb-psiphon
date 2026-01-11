@@ -1,185 +1,129 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# === Config defaults ===
-DEFAULT_VLESS_PORT="443"      # TCP
-DEFAULT_HY2_PORT="8443"       # UDP
-DEFAULT_TUIC_PORT="2053"      # UDP
-DEFAULT_PSI_SOCKS_PORT="1081" # local socks5 provided by warp-plus
-DEFAULT_PSI_COUNTRY="US"
+# ========= 可调默认值 =========
+DEFAULT_HOST="example.com"
+DEFAULT_VLESS_PORT="443"
+DEFAULT_HY2_PORT="8443"
+DEFAULT_TUIC_PORT="2053"
+DEFAULT_REALITY_SNI="www.apple.com"
+DEFAULT_CERT_MODE="self"   # self | le
+DEFAULT_PSIPHON_COUNTRY="US"
+DEFAULT_PSIPHON_SOCKS="1081"
 
-SB_CONFIG_DIR="/etc/sing-box"
-SB_CONFIG_FILE="${SB_CONFIG_DIR}/config.json"
-WARPPLUS_BIN="/usr/local/bin/warp-plus"
-WARPPLUS_DIR="/etc/warp-plus"
-WARPPLUS_ENV="${WARPPLUS_DIR}/warp-plus.env"
-WARPPLUS_SERVICE="/etc/systemd/system/warp-plus.service"
+# ========= 工具函数 =========
+red(){ echo -e "\033[31m$*\033[0m" >&2; }
+grn(){ echo -e "\033[32m$*\033[0m" >&2; }
+ylw(){ echo -e "\033[33m$*\033[0m" >&2; }
 
-color() { local c="$1"; shift; printf "\033[%sm%s\033[0m\n" "$c" "$*" >&2; }
-info() { color "36" "[*] $*"; }
-ok()   { color "32" "[+] $*"; }
-warn() { color "33" "[!] $*"; }
-err()  { color "31" "[-] $*"; }
-
-need_root() {
-  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    err "请用 root 运行：sudo -i 或 sudo bash install.sh"
+need_root(){
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    red "请用 root 运行：sudo -i"
     exit 1
   fi
 }
 
-detect_pm() {
-  if command -v apt-get >/dev/null 2>&1; then echo "apt"; return; fi
-  if command -v dnf >/dev/null 2>&1; then echo "dnf"; return; fi
-  if command -v yum >/dev/null 2>&1; then echo "yum"; return; fi
-  err "不支持的系统：找不到 apt/dnf/yum"
-  exit 1
-}
-
-install_deps() {
-  local pm; pm="$(detect_pm)"
-  info "安装依赖 (curl, jq, unzip, openssl, socat, ca-certificates)..."
-  if [[ "$pm" == "apt" ]]; then
-    apt-get update -y
-    apt-get install -y curl jq unzip openssl socat ca-certificates cron
-  else
-    "$pm" -y install curl jq unzip openssl socat ca-certificates cronie || true
-    systemctl enable --now crond >/dev/null 2>&1 || true
-  fi
-  ok "依赖安装完成"
-}
-
-read_input() {
-  local prompt="$1" default="$2" var
-  read -r -p "${prompt} (默认: ${default}): " var || true
-  if [[ -z "${var}" ]]; then var="$default"; fi
-  echo "$var"
-}
-
-get_arch() {
-  local a; a="$(uname -m)"
+detect_arch(){
+  local a
+  a="$(uname -m)"
   case "$a" in
     x86_64|amd64) echo "amd64" ;;
     aarch64|arm64) echo "arm64" ;;
-    *)
-      err "不支持的架构: $a (仅支持 amd64/arm64)"
-      exit 1
-      ;;
+    *) red "不支持的架构: $a"; exit 1 ;;
   esac
 }
 
-install_singbox() {
-  if command -v sing-box >/dev/null 2>&1; then
-    ok "sing-box 已安装：$(sing-box version 2>/dev/null | head -n1 || true)"
-    return
-  fi
-  info "安装 sing-box (官方脚本)..."
-  # 官方安装方式（文档）
-  curl -fsSL https://sing-box.app/install.sh | sh
-  ok "sing-box 安装完成"
+detect_pm(){
+  if command -v apt-get >/dev/null 2>&1; then echo "apt"; return; fi
+  if command -v dnf >/dev/null 2>&1; then echo "dnf"; return; fi
+  if command -v yum >/dev/null 2>&1; then echo "yum"; return; fi
+  red "不支持的系统：找不到 apt/dnf/yum"
+  exit 1
 }
 
-install_warpplus() {
-  local arch; arch="$(get_arch)"
-  info "安装 warp-plus (Psiphon 出站提供本地 SOCKS5)..."
-  mkdir -p /tmp/warpplus && cd /tmp/warpplus
+install_deps(){
+  local pm
+  pm="$(detect_pm)"
+  ylw "[*] 安装依赖..."
+  if [[ "$pm" == "apt" ]]; then
+    apt-get update -y
+    apt-get install -y curl jq unzip openssl ca-certificates socat cron
+  else
+    "$pm" -y install curl jq unzip openssl ca-certificates socat cronie || true
+    systemctl enable --now crond >/dev/null 2>&1 || true
+  fi
+  grn "[+] 依赖安装完成"
+}
 
-  # GitHub API: latest release asset
+prompt(){
+  local var="$1" msg="$2" def="$3" val=""
+  read -r -p "$msg (默认: $def): " val || true
+  val="${val:-$def}"
+  printf -v "$var" "%s" "$val"
+}
+
+gen_uuid(){
+  cat /proc/sys/kernel/random/uuid
+}
+
+rand_hex(){
+  openssl rand -hex "$1"
+}
+
+download_latest_github_release_asset(){
+  local repo="$1" regex="$2"
+  local api="https://api.github.com/repos/${repo}/releases/latest"
+  local url
+  url="$(curl -fsSL "$api" | jq -r ".assets[].browser_download_url" | grep -E "$regex" | head -n1 || true)"
+  if [[ -z "$url" ]]; then
+    red "找不到 ${repo} 的 release 资源：$regex"
+    exit 1
+  fi
+  echo "$url"
+}
+
+# ========= warp-plus (Psiphon SOCKS5) =========
+install_warp_plus(){
+  local arch="$1"
+
+  ylw "[*] 安装 warp-plus..."
   local api="https://api.github.com/repos/bepass-org/warp-plus/releases/latest"
   local asset="warp-plus_linux-${arch}.zip"
   local url
   url="$(curl -fsSL "$api" | jq -r --arg A "$asset" '.assets[] | select(.name==$A) | .browser_download_url' | head -n1)"
-  if [[ -z "${url}" || "${url}" == "null" ]]; then
-    err "获取 warp-plus 下载链接失败（架构: ${arch}）"
+  
+  if [[ -z "$url" || "$url" == "null" ]]; then
+    red "获取 warp-plus 下载链接失败（架构: ${arch}）"
     exit 1
   fi
 
-  curl -fL "$url" -o "$asset"
-  unzip -o "$asset" >/dev/null
+  rm -rf /tmp/warp-plus && mkdir -p /tmp/warp-plus
+  curl -fsSL "$url" -o /tmp/warp-plus/pkg.zip
+  unzip -q /tmp/warp-plus/pkg.zip -d /tmp/warp-plus || true
 
-  # zip 里通常就叫 warp-plus
-  if [[ -f "warp-plus" ]]; then
-    install -m 0755 "warp-plus" "$WARPPLUS_BIN"
-  else
-    # 兜底：找一个可执行文件
-    local f
-    f="$(find . -maxdepth 2 -type f -name 'warp-plus*' -perm -111 | head -n1 || true)"
-    [[ -n "$f" ]] || { err "解压后未找到 warp-plus 可执行文件"; exit 1; }
-    install -m 0755 "$f" "$WARPPLUS_BIN"
+  local bin
+  bin="$(find /tmp/warp-plus -type f -name "warp-plus" | head -n1 || true)"
+  if [[ -z "$bin" ]]; then
+    bin="$(find /tmp/warp-plus -type f -perm -111 | head -n1 || true)"
+  fi
+  if [[ -z "$bin" ]]; then
+    red "warp-plus 包结构未知，未找到可执行文件"
+    exit 1
   fi
 
-  ok "warp-plus 安装完成：$($WARPPLUS_BIN --help 2>/dev/null | head -n1 || echo OK)"
+  install -m 0755 "$bin" /usr/local/bin/warp-plus
+  grn "[+] warp-plus 安装完成"
+
+  mkdir -p /etc/warp-plus
+  cat > /etc/warp-plus/config.json <<EOF
+{
+  "bind": "127.0.0.1:${PSIPHON_SOCKS}",
+  "cfon": true,
+  "country": "${PSIPHON_COUNTRY}"
 }
-
-setup_cert() {
-  local host="$1"
-  local mode="$2"   # le/self
-  local email="$3"
-  local cert_path key_path
-
-  mkdir -p /etc/ssl/sbox
-
-  if [[ "$mode" == "le" ]]; then
-    info "申请 Let's Encrypt 证书 (certbot standalone，需要 80/tcp 空闲)..."
-    local pm; pm="$(detect_pm)"
-    if [[ "$pm" == "apt" ]]; then
-      apt-get install -y certbot
-    else
-      "$pm" -y install certbot || true
-    fi
-
-    systemctl stop nginx >/dev/null 2>&1 || true
-    systemctl stop caddy >/dev/null 2>&1 || true
-    systemctl stop apache2 >/dev/null 2>&1 || true
-    systemctl stop httpd >/dev/null 2>&1 || true
-
-    certbot certonly --standalone --agree-tos --non-interactive -m "$email" -d "$host"
-    cert_path="/etc/letsencrypt/live/${host}/fullchain.pem"
-    key_path="/etc/letsencrypt/live/${host}/privkey.pem"
-
-    [[ -f "$cert_path" && -f "$key_path" ]] || { err "证书文件不存在：${cert_path} / ${key_path}"; exit 1; }
-    ok "证书申请成功：${cert_path}"
-  else
-    info "生成自签证书（客户端需跳过验证/允许不安全证书）..."
-    cert_path="/etc/ssl/sbox/self.crt"
-    key_path="/etc/ssl/sbox/self.key"
-    openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
-      -keyout "$key_path" -out "$cert_path" \
-      -subj "/CN=${host}"
-    ok "自签证书生成：${cert_path}"
-  fi
-
-  echo "${cert_path}|${key_path}"
-}
-
-open_firewall() {
-  local vless_port="$1" hy2_port="$2" tuic_port="$3"
-  info "配置防火墙放行端口..."
-  if command -v ufw >/dev/null 2>&1; then
-    ufw allow "${vless_port}/tcp" || true
-    ufw allow "${hy2_port}/udp" || true
-    ufw allow "${tuic_port}/udp" || true
-    ufw allow "22/tcp" || true
-    ufw allow "80/tcp" || true
-    ufw --force enable || true
-    ok "ufw 已放行：${vless_port}/tcp, ${hy2_port}/udp, ${tuic_port}/udp"
-  else
-    warn "未检测到 ufw：请自行放行端口 ${vless_port}/tcp, ${hy2_port}/udp, ${tuic_port}/udp"
-  fi
-}
-
-write_warpplus_service() {
-  local country="$1" socks_port="$2"
-
-  mkdir -p "$WARPPLUS_DIR"
-  cat > "$WARPPLUS_ENV" <<EOF
-# warp-plus env
-COUNTRY=${country}
-SOCKS_BIND=127.0.0.1:${socks_port}
-EXTRA_FLAGS=--cfon
 EOF
 
-  cat > "$WARPPLUS_SERVICE" <<'EOF'
+  cat > /etc/systemd/system/warp-plus.service <<'EOF'
 [Unit]
 Description=warp-plus (WARP + Psiphon) local SOCKS5
 After=network-online.target
@@ -187,8 +131,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=/etc/warp-plus/warp-plus.env
-ExecStart=/usr/local/bin/warp-plus -4 ${EXTRA_FLAGS} --country ${COUNTRY} -b ${SOCKS_BIND}
+ExecStart=/usr/local/bin/warp-plus -4 -c /etc/warp-plus/config.json
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -199,527 +142,521 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now warp-plus
-  ok "warp-plus 已启动（SOCKS5: 127.0.0.1:${socks_port}, 国家: ${country}）"
+  grn "[+] warp-plus 已启动（SOCKS5: 127.0.0.1:${PSIPHON_SOCKS}, 国家: ${PSIPHON_COUNTRY}）"
 }
 
-gen_keys() {
-  # 注意：不要在这里调用 info()，因为 stdout 会被捕获
-  local vless_uuid tuic_uuid tuic_pass hy2_pass hy2_obfs reality_out private_key public_key short_id
+# ========= Xray (VLESS + REALITY) =========
+install_xray_vless_reality(){
+  local arch="$1"
 
-  # UUID：优先用 sing-box，fallback 到 /proc/sys/kernel/random/uuid
-  vless_uuid="$(sing-box generate uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)"
-  tuic_uuid="$(sing-box generate uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)"
-  tuic_pass="$(openssl rand -base64 18 | tr -d '=+/ ' | head -c 16)"
-  hy2_pass="$(openssl rand -base64 24 | tr -d '=+/ ' | head -c 20)"
-  hy2_obfs="$(openssl rand -base64 24 | tr -d '=+/ ' | head -c 20)"
+  ylw "[*] 安装 Xray-core（VLESS+REALITY）..."
+  local url
+  if [[ "$arch" == "amd64" ]]; then
+    url="$(download_latest_github_release_asset "XTLS/Xray-core" "Xray-linux-64.zip")"
+  else
+    url="$(download_latest_github_release_asset "XTLS/Xray-core" "Xray-linux-arm64-v8a.zip")"
+  fi
 
-  # reality-keypair 输出格式是文本 "PrivateKey: xxx\nPublicKey: xxx"，不是 JSON
-  reality_out="$(sing-box generate reality-keypair 2>/dev/null)"
-  private_key="$(echo "$reality_out" | awk -F': *' '/PrivateKey/{print $2}')"
-  public_key="$(echo "$reality_out" | awk -F': *' '/PublicKey/{print $2}')"
-  
-  # short_id：优先用 sing-box，fallback 到 openssl
-  short_id="$(sing-box generate rand --hex 8 2>/dev/null || openssl rand -hex 8)"
+  rm -rf /tmp/xray && mkdir -p /tmp/xray
+  curl -fsSL "$url" -o /tmp/xray/xray.zip
+  unzip -q /tmp/xray/xray.zip -d /tmp/xray
 
-  echo "${vless_uuid}|${tuic_uuid}|${tuic_pass}|${hy2_pass}|${hy2_obfs}|${private_key}|${public_key}|${short_id}"
-}
+  install -m 0755 /tmp/xray/xray /usr/local/bin/xray
+  mkdir -p /usr/local/share/xray
+  cp -f /tmp/xray/*.dat /usr/local/share/xray/ 2>/dev/null || true
 
-write_singbox_config() {
-  local host="$1"
-  local vless_port="$2" hy2_port="$3" tuic_port="$4"
-  local cert_path="$5" key_path="$6"
-  local reality_server="$7"
-  local vless_uuid="$8"
-  local tuic_uuid="$9"
-  local tuic_pass="${10}"
-  local hy2_pass="${11}"
-  local hy2_obfs="${12}"
-  local reality_private="${13}"
-  local short_id="${14}"
-  local psi_socks_port="${15}"
+  # 生成 REALITY keypair
+  local keypair priv pub sid uuid
+  keypair="$(/usr/local/bin/xray x25519)"
+  priv="$(echo "$keypair" | awk -F': ' '/Private key/ {print $2}')"
+  pub="$(echo "$keypair" | awk -F': ' '/Public key/ {print $2}')"
+  sid="$(rand_hex 8)"
+  uuid="$(gen_uuid)"
 
-  mkdir -p "$SB_CONFIG_DIR"
-
-  # sing-box 入站：VLESS/REALITY + HY2 + TUIC
-  # 出站：direct + socks(psiphon)；路由：TCP -> psiphon, UDP -> direct（更稳）
-  cat > "$SB_CONFIG_FILE" <<EOF
+  mkdir -p /etc/xray
+  cat > /etc/xray/config.json <<EOF
 {
-  "log": {
-    "level": "info",
-    "timestamp": true
-  },
+  "log": { "loglevel": "warning" },
   "inbounds": [
     {
-      "type": "vless",
-      "tag": "in-vless-reality",
-      "listen": "::",
-      "listen_port": ${vless_port},
-      "users": [
-        {
-          "name": "vless",
-          "uuid": "${vless_uuid}",
-          "flow": "xtls-rprx-vision"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "${reality_server}",
-            "server_port": 443
-          },
-          "private_key": "${reality_private}",
-          "short_id": [
-            "${short_id}"
-          ],
-          "max_time_difference": "1m"
-        }
-      }
-    },
-    {
-      "type": "hysteria2",
-      "tag": "in-hy2",
-      "listen": "::",
-      "listen_port": ${hy2_port},
-      "up_mbps": 0,
-      "down_mbps": 0,
-      "obfs": {
-        "type": "salamander",
-        "password": "${hy2_obfs}"
+      "listen": "0.0.0.0",
+      "port": ${VLESS_PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          { "id": "${uuid}", "flow": "xtls-rprx-vision" }
+        ],
+        "decryption": "none"
       },
-      "users": [
-        {
-          "name": "hy2",
-          "password": "${hy2_pass}"
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "dest": "${REALITY_SNI}:443",
+          "serverNames": ["${REALITY_SNI}"],
+          "privateKey": "${priv}",
+          "shortIds": ["${sid}"]
         }
-      ],
-      "tls": {
-        "enabled": true,
-        "alpn": ["h3"],
-        "certificate_path": "${cert_path}",
-        "key_path": "${key_path}"
-      }
-    },
-    {
-      "type": "tuic",
-      "tag": "in-tuic",
-      "listen": "::",
-      "listen_port": ${tuic_port},
-      "users": [
-        {
-          "name": "tuic",
-          "uuid": "${tuic_uuid}",
-          "password": "${tuic_pass}"
-        }
-      ],
-      "congestion_control": "bbr",
-      "auth_timeout": "3s",
-      "zero_rtt_handshake": false,
-      "heartbeat": "10s",
-      "tls": {
-        "enabled": true,
-        "alpn": ["h3"],
-        "certificate_path": "${cert_path}",
-        "key_path": "${key_path}"
-      }
+      },
+      "sniffing": { "enabled": true, "destOverride": ["http","tls"] }
     }
   ],
   "outbounds": [
-    { "type": "direct", "tag": "direct" },
     {
-      "type": "socks",
+      "protocol": "socks",
       "tag": "psiphon",
-      "server": "127.0.0.1",
-      "server_port": ${psi_socks_port},
-      "version": "5"
+      "settings": {
+        "servers": [
+          { "address": "127.0.0.1", "port": ${PSIPHON_SOCKS} }
+        ]
+      }
     }
   ],
-  "route": {
+  "routing": {
+    "domainStrategy": "AsIs",
     "rules": [
-      { "network": "udp", "outbound": "direct" },
-      { "network": "tcp", "outbound": "psiphon" }
-    ],
-    "final": "psiphon"
+      { "type": "field", "outboundTag": "psiphon", "network": "tcp,udp" }
+    ]
   }
 }
 EOF
 
-  ok "sing-box 配置已写入：${SB_CONFIG_FILE}"
+  cat > /etc/systemd/system/xray.service <<'EOF'
+[Unit]
+Description=Xray-core (VLESS+REALITY) Server
+After=network-online.target warp-plus.service
+Wants=network-online.target warp-plus.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xray run -config /etc/xray/config.json
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now xray
+  grn "[+] Xray 已启动：VLESS+REALITY"
+
+  XRAY_UUID="$uuid"
+  XRAY_PUB="$pub"
+  XRAY_SID="$sid"
 }
 
-restart_singbox() {
-  info "启动/重启 sing-box..."
-  systemctl enable --now sing-box >/dev/null 2>&1 || true
-  systemctl restart sing-box
-  ok "sing-box 已启动"
-}
+# ========= Hysteria2 =========
+install_hysteria2(){
+  local arch="$1"
 
-print_client_info() {
-  local host="$1"
-  local vless_port="$2" hy2_port="$3" tuic_port="$4"
-  local reality_server="$5"
-  local vless_uuid="$6"
-  local tuic_uuid="$7"
-  local tuic_pass="$8"
-  local hy2_pass="$9"
-  local hy2_obfs="${10}"
-  local reality_public="${11}"
-  local short_id="${12}"
-  local tls_mode="${13}"
-
-  local insecure_hint=""
-  if [[ "$tls_mode" != "le" ]]; then
-    insecure_hint="（自签：客户端需要 skip-cert-verify / insecure=true）"
+  ylw "[*] 安装 Hysteria2..."
+  local url
+  if [[ "$arch" == "amd64" ]]; then
+    url="$(download_latest_github_release_asset "apernet/hysteria" "hysteria-linux-amd64$")"
+  else
+    url="$(download_latest_github_release_asset "apernet/hysteria" "hysteria-linux-arm64$")"
   fi
 
-  echo ""
-  echo "==================== 客户端参数（请妥善保存）===================="
-  echo ""
-  echo "[VLESS + REALITY]"
-  echo "  地址: ${host}"
-  echo "  端口: ${vless_port} (TCP)"
-  echo "  UUID: ${vless_uuid}"
-  echo "  Flow: xtls-rprx-vision"
-  echo "  SNI/ServerName: ${reality_server}"
-  echo "  Reality PublicKey (pbk): ${reality_public}"
-  echo "  Reality ShortID (sid): ${short_id}"
-  echo "  指纹(fp): chrome"
-  echo ""
-  echo "  参考分享链接格式(通用)："
-  echo "  vless://${vless_uuid}@${host}:${vless_port}?encryption=none&security=reality&sni=${reality_server}&fp=chrome&pbk=${reality_public}&sid=${short_id}&type=tcp&flow=xtls-rprx-vision#vless-reality"
-  echo ""
-  echo "[Hysteria2] ${insecure_hint}"
-  echo "  地址: ${host}"
-  echo "  端口: ${hy2_port} (UDP)"
-  echo "  密码: ${hy2_pass}"
-  echo "  OBFS: salamander"
-  echo "  OBFS密码: ${hy2_obfs}"
-  echo "  ALPN: h3"
-  echo "  SNI: ${host}"
-  echo ""
-  echo "[TUIC v5] ${insecure_hint}"
-  echo "  地址: ${host}"
-  echo "  端口: ${tuic_port} (UDP)"
-  echo "  UUID: ${tuic_uuid}"
-  echo "  密码: ${tuic_pass}"
-  echo "  ALPN: h3"
-  echo "  Congestion: bbr"
-  echo ""
-  echo "==============================================================="
-  echo ""
-  echo "管理命令："
-  echo "  proxyctl status"
-  echo "  proxyctl country US"
-  echo "  proxyctl country-test US JP SG DE FR GB"
-  echo "  proxyctl egress-test"
-  echo ""
+  curl -fsSL "$url" -o /usr/local/bin/hysteria
+  chmod +x /usr/local/bin/hysteria
+
+  local hy_pass obfs_pass
+  hy_pass="$(rand_hex 12)"
+  obfs_pass="$(rand_hex 12)"
+
+  mkdir -p /etc/hysteria
+  mkdir -p /etc/ssl/sbox
+
+  # 生成自签证书（如果不存在）
+  if [[ ! -f /etc/ssl/sbox/self.key ]]; then
+    openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+      -keyout /etc/ssl/sbox/self.key -out /etc/ssl/sbox/self.crt \
+      -subj "/CN=${HOST}" >/dev/null 2>&1
+  fi
+
+  if [[ "$CERT_MODE" == "le" ]]; then
+    cat > /etc/hysteria/config.yaml <<EOF
+listen: :${HY2_PORT}
+acme:
+  domains:
+    - ${HOST}
+  email: admin@${HOST}
+auth:
+  type: password
+  password: ${hy_pass}
+obfs:
+  type: salamander
+  salamander:
+    password: ${obfs_pass}
+outbounds:
+  - name: psiphon
+    type: socks5
+    socks5:
+      addr: 127.0.0.1:${PSIPHON_SOCKS}
+EOF
+  else
+    cat > /etc/hysteria/config.yaml <<EOF
+listen: :${HY2_PORT}
+tls:
+  cert: /etc/ssl/sbox/self.crt
+  key: /etc/ssl/sbox/self.key
+auth:
+  type: password
+  password: ${hy_pass}
+obfs:
+  type: salamander
+  salamander:
+    password: ${obfs_pass}
+outbounds:
+  - name: psiphon
+    type: socks5
+    socks5:
+      addr: 127.0.0.1:${PSIPHON_SOCKS}
+EOF
+  fi
+
+  cat > /etc/systemd/system/hysteria2.service <<'EOF'
+[Unit]
+Description=Hysteria2 Server
+After=network-online.target warp-plus.service
+Wants=network-online.target warp-plus.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now hysteria2
+  grn "[+] Hysteria2 已启动"
+
+  HY2_PASS="$hy_pass"
+  HY2_OBFS="$obfs_pass"
 }
 
-# -------------------- main --------------------
-need_root
-install_deps
+# ========= TUIC (EAimTY/tuic 官方实现) =========
+install_tuic_server(){
+  local arch="$1"
 
-HOST="$(read_input '请输入用于客户端连接的域名或IP（HOST）' 'example.com')"
-VLESS_PORT="$(read_input 'VLESS+REALITY 端口(TCP)' "$DEFAULT_VLESS_PORT")"
-HY2_PORT="$(read_input 'Hysteria2 端口(UDP)' "$DEFAULT_HY2_PORT")"
-TUIC_PORT="$(read_input 'TUIC v5 端口(UDP)' "$DEFAULT_TUIC_PORT")"
+  ylw "[*] 安装 tuic-server..."
+  local url
+  if [[ "$arch" == "amd64" ]]; then
+    url="$(download_latest_github_release_asset "EAimTY/tuic" "tuic-server.*x86_64.*linux" || true)"
+  else
+    url="$(download_latest_github_release_asset "EAimTY/tuic" "tuic-server.*aarch64.*linux" || true)"
+  fi
 
-REALITY_SERVER="$(read_input 'REALITY 伪装站点(需支持TLS1.3/H2，示例 www.microsoft.com)' 'www.microsoft.com')"
+  if [[ -z "$url" ]]; then
+    ylw "[!] 未能自动获取 tuic-server，尝试备用方式..."
+    # 尝试直接从 releases 列表获取
+    local api="https://api.github.com/repos/EAimTY/tuic/releases"
+    if [[ "$arch" == "amd64" ]]; then
+      url="$(curl -fsSL "$api" | jq -r '.[0].assets[].browser_download_url' | grep -i "tuic-server.*x86_64.*linux" | head -n1 || true)"
+    else
+      url="$(curl -fsSL "$api" | jq -r '.[0].assets[].browser_download_url' | grep -i "tuic-server.*aarch64.*linux" | head -n1 || true)"
+    fi
+  fi
 
-TLS_MODE="$(read_input 'HY2/TUIC TLS证书模式：le(自动申请) 或 self(自签)' 'self')"
-EMAIL="admin@${HOST}"
-if [[ "$TLS_MODE" == "le" ]]; then
-  EMAIL="$(read_input 'Let'\''s Encrypt 邮箱（用于到期通知）' "$EMAIL")"
-fi
+  if [[ -z "$url" ]]; then
+    red "未能获取 tuic-server 下载链接，请手动下载放到 /usr/local/bin/tuic-server"
+    exit 1
+  fi
 
-PSI_COUNTRY="$(read_input 'Psiphon 出站国家(两位代码，如 US/JP/SG/DE...)' "$DEFAULT_PSI_COUNTRY")"
-PSI_SOCKS_PORT="$(read_input 'warp-plus 本地 SOCKS5 端口' "$DEFAULT_PSI_SOCKS_PORT")"
+  curl -fsSL "$url" -o /usr/local/bin/tuic-server
+  chmod +x /usr/local/bin/tuic-server
 
-open_firewall "$VLESS_PORT" "$HY2_PORT" "$TUIC_PORT"
+  local tuic_uuid tuic_pass
+  tuic_uuid="$(gen_uuid)"
+  tuic_pass="$(rand_hex 10)"
 
-install_singbox
-install_warpplus
+  mkdir -p /etc/tuic
 
-# cert
-cert_pair="$(setup_cert "$HOST" "$TLS_MODE" "$EMAIL")"
-CERT_PATH="${cert_pair%|*}"
-KEY_PATH="${cert_pair#*|}"
+  cat > /etc/tuic/config.json <<EOF
+{
+  "server": "[::]:${TUIC_PORT}",
+  "users": {
+    "${tuic_uuid}": "${tuic_pass}"
+  },
+  "certificate": "/etc/ssl/sbox/self.crt",
+  "private_key": "/etc/ssl/sbox/self.key",
+  "congestion_control": "bbr",
+  "alpn": ["h3"],
+  "zero_rtt_handshake": false,
+  "auth_timeout": "3s",
+  "max_idle_time": "10s",
+  "log_level": "info"
+}
+EOF
 
-# keys
-info "生成 VLESS/TUIC UUID、HY2 密码、REALITY 密钥与 short_id..."
-keys="$(gen_keys)"
-vless_uuid="$(echo "$keys" | cut -d'|' -f1)"
-tuic_uuid="$(echo "$keys" | cut -d'|' -f2)"
-tuic_pass="$(echo "$keys" | cut -d'|' -f3)"
-hy2_pass="$(echo "$keys" | cut -d'|' -f4)"
-hy2_obfs="$(echo "$keys" | cut -d'|' -f5)"
-reality_private="$(echo "$keys" | cut -d'|' -f6)"
-reality_public="$(echo "$keys" | cut -d'|' -f7)"
-short_id="$(echo "$keys" | cut -d'|' -f8)"
+  cat > /etc/systemd/system/tuic.service <<'EOF'
+[Unit]
+Description=tuic-server
+After=network-online.target warp-plus.service
+Wants=network-online.target warp-plus.service
 
-write_warpplus_service "$PSI_COUNTRY" "$PSI_SOCKS_PORT"
-write_singbox_config "$HOST" "$VLESS_PORT" "$HY2_PORT" "$TUIC_PORT" "$CERT_PATH" "$KEY_PATH" "$REALITY_SERVER" \
-  "$vless_uuid" "$tuic_uuid" "$tuic_pass" "$hy2_pass" "$hy2_obfs" "$reality_private" "$short_id" "$PSI_SOCKS_PORT"
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tuic-server -c /etc/tuic/config.json
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
 
-restart_singbox
+[Install]
+WantedBy=multi-user.target
+EOF
 
-# install proxyctl (embedded for curl|bash support)
-info "安装 proxyctl 管理命令..."
-cat > /usr/local/bin/proxyctl <<'PROXYCTL_EOF'
+  systemctl daemon-reload
+  systemctl enable --now tuic
+  grn "[+] TUIC 已启动"
+
+  TUIC_UUID="$tuic_uuid"
+  TUIC_PASS="$tuic_pass"
+}
+
+# ========= proxyctl =========
+install_proxyctl(){
+  ylw "[*] 安装 proxyctl..."
+  cat > /usr/local/bin/proxyctl <<'PROXYCTL_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-WARPPLUS_ENV="/etc/warp-plus/warp-plus.env"
-SB_CONFIG="/etc/sing-box/config.json"
+CFG="/etc/warp-plus/config.json"
+SOCKS_PORT="$(jq -r '.bind' "$CFG" 2>/dev/null | awk -F: '{print $2}' || echo "1081")"
+COUNTRY="$(jq -r '.country' "$CFG" 2>/dev/null || echo "US")"
 
-usage() {
-  cat <<'EOF'
-proxyctl - sing-box + warp-plus (Psiphon) 管理工具
+usage(){
+  cat <<USAGE
+proxyctl - 管理 warp-plus(Psiphon) 出站 + 出口测试
 
 用法:
-  proxyctl status               查看 warp-plus 和 sing-box 运行状态
-  proxyctl country <CC>         切换 Psiphon 出站国家 (例如 US / JP / SG / DE)
-  proxyctl egress-test          测试当前出口 IP 归属国家
-  proxyctl country-test <CC...> 批量测试哪些国家能成功出站
-  proxyctl restart              重启 warp-plus 和 sing-box
-  proxyctl logs [sb|wp]         查看日志 (sb=sing-box, wp=warp-plus)
-EOF
+  proxyctl status               查看服务状态
+  proxyctl country <CC>         切换出口国家
+  proxyctl egress-test          测试当前出口 IP
+  proxyctl country-test <CC...> 批量测试国家可用性
+  proxyctl restart              重启所有服务
+  proxyctl logs [wp|xray|hy2|tuic]
+USAGE
 }
 
-must_root() {
-  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    echo "请用 root 运行：sudo proxyctl ..."
-    exit 1
-  fi
-}
-
-get_socks_port() {
-  local bind
-  bind="$(grep -E '^SOCKS_BIND=' "$WARPPLUS_ENV" | cut -d= -f2- || true)"
-  echo "${bind##*:}"
-}
-
-get_current_country() {
-  grep -E '^COUNTRY=' "$WARPPLUS_ENV" | cut -d= -f2- || echo "未知"
-}
-
-status() {
-  echo "========== warp-plus 状态 =========="
-  echo "  当前国家: $(get_current_country)"
-  echo "  SOCKS端口: $(get_socks_port)"
-  systemctl --no-pager -l status warp-plus 2>/dev/null || echo "  服务未运行或未安装"
-  echo ""
-  echo "========== sing-box 状态 =========="
-  systemctl --no-pager -l status sing-box 2>/dev/null || echo "  服务未运行或未安装"
-}
-
-restart_all() {
-  echo "重启 warp-plus..."
-  systemctl restart warp-plus 2>/dev/null || echo "warp-plus 重启失败"
-  echo "重启 sing-box..."
-  systemctl restart sing-box 2>/dev/null || echo "sing-box 重启失败"
-  echo "已重启 warp-plus & sing-box"
-}
-
-set_country() {
-  local cc="$1"
-  [[ -n "$cc" ]] || { echo "缺少国家代码"; exit 1; }
-  cc="${cc^^}"
-  sed -i "s/^COUNTRY=.*/COUNTRY=${cc}/" "$WARPPLUS_ENV"
-  systemctl restart warp-plus
-  echo "已切换 Psiphon 国家为 ${cc}，等待服务就绪..."
-  sleep 2
-}
-
-egress_test() {
-  local port; port="$(get_socks_port)"
-  echo "[egress-test] SOCKS5 -> 127.0.0.1:${port}"
-  echo "当前设置国家: $(get_current_country)"
-  echo ""
-  
-  local result
-  if command -v curl >/dev/null 2>&1; then
-    result="$(curl -fsS --max-time 10 --socks5-hostname "127.0.0.1:${port}" https://ipinfo.io/json 2>/dev/null)" \
-      || result="$(curl -fsS --max-time 10 --socks5-hostname "127.0.0.1:${port}" https://ifconfig.co/json 2>/dev/null)" \
-      || result="$(curl -fsS --max-time 10 --socks5-hostname "127.0.0.1:${port}" https://ipapi.co/json 2>/dev/null)" \
-      || { echo "出口测试失败：无法通过 SOCKS 拉取外网信息"; exit 2; }
-    
-    echo "$result" | jq . 2>/dev/null || echo "$result"
-  else
-    echo "缺少 curl"
-    exit 1
-  fi
-  echo ""
-}
-
-country_test() {
-  shift || true
-  local codes=("$@")
-  if [[ "${#codes[@]}" -eq 0 ]]; then
-    echo "请提供国家代码列表，例如：proxyctl country-test US JP SG DE FR GB"
-    exit 1
-  fi
-
-  local port; port="$(get_socks_port)"
-  echo "[country-test] 使用 SOCKS 端口 127.0.0.1:${port}"
-  echo "将逐个切换 warp-plus 国家并测试出口归属"
-  echo ""
-
-  local success=()
-  local failed=()
-  local mismatch=()
-
-  for cc in "${codes[@]}"; do
-    cc="${cc^^}"
-    echo "==> 测试 ${cc}"
-    set_country "$cc" >/dev/null 2>&1
-    sleep 3
-
-    local json country
-    json="$( (curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${port}" https://ipinfo.io/json 2>/dev/null \
-              || curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${port}" https://ifconfig.co/json 2>/dev/null \
-              || curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${port}" https://ipapi.co/json 2>/dev/null) || true )"
-
-    if [[ -z "$json" ]]; then
-      echo "  [-] ${cc} 失败（无响应）"
-      failed+=("$cc")
-      continue
-    fi
-
-    if command -v jq >/dev/null 2>&1; then
-      country="$(echo "$json" | jq -r '.country // .country_code // .country_iso // empty' 2>/dev/null || true)"
-    else
-      country=""
-    fi
-
-    if [[ -n "$country" ]]; then
-      if [[ "${country^^}" == "${cc}" ]]; then
-        echo "  [+] ${cc} 成功（country=${country}）"
-        success+=("$cc")
-      else
-        echo "  [~] ${cc} 有响应但归属不一致（country=${country}）"
-        mismatch+=("${cc}→${country}")
-      fi
-    else
-      echo "  [~] ${cc} 有响应但解析不到 country 字段"
-      mismatch+=("${cc}→?")
-    fi
-  done
-
-  echo ""
-  echo "========== 测试结果汇总 =========="
-  echo "  成功: ${success[*]:-无}"
-  echo "  失败: ${failed[*]:-无}"
-  echo "  归属不一致: ${mismatch[*]:-无}"
-}
-
-show_logs() {
-  local target="${1:-all}"
-  case "$target" in
-    sb|singbox|sing-box)
-      journalctl -u sing-box -f --no-pager
-      ;;
-    wp|warp|warp-plus)
-      journalctl -u warp-plus -f --no-pager
-      ;;
-    *)
-      echo "同时显示 warp-plus 和 sing-box 日志（Ctrl+C 退出）"
-      journalctl -u warp-plus -u sing-box -f --no-pager
-      ;;
-  esac
+egress_test(){
+  curl -fsS --max-time 10 --socks5-hostname "127.0.0.1:${SOCKS_PORT}" https://ipinfo.io/json 2>/dev/null \
+    | jq -r '"IP: \(.ip)\nCountry: \(.country)\nOrg: \(.org)\nCity: \(.city)\nRegion: \(.region)"' || {
+      echo "[-] 出口测试失败（SOCKS 无响应）"
+      return 1
+    }
 }
 
 case "${1:-}" in
-  status) must_root; status ;;
-  restart) must_root; restart_all ;;
-  country) must_root; set_country "${2:-}" ;;
-  egress-test) must_root; egress_test ;;
-  country-test) must_root; country_test "$@" ;;
-  logs) must_root; show_logs "${2:-}" ;;
-  *) usage; exit 0 ;;
+  status)
+    echo "========== warp-plus =========="
+    echo "Country: ${COUNTRY}"
+    echo "SOCKS : 127.0.0.1:${SOCKS_PORT}"
+    systemctl --no-pager -l status warp-plus 2>/dev/null || echo "未运行"
+    echo
+    echo "========== xray =========="
+    systemctl --no-pager -l status xray 2>/dev/null || echo "未运行"
+    echo
+    echo "========== hysteria2 =========="
+    systemctl --no-pager -l status hysteria2 2>/dev/null || echo "未运行"
+    echo
+    echo "========== tuic =========="
+    systemctl --no-pager -l status tuic 2>/dev/null || echo "未运行"
+    ;;
+  country)
+    cc="${2:-}"
+    if [[ -z "$cc" ]]; then usage; exit 1; fi
+    cc="${cc^^}"
+    tmp="$(mktemp)"
+    jq --arg cc "$cc" '.country=$cc' "$CFG" > "$tmp"
+    mv "$tmp" "$CFG"
+    systemctl restart warp-plus
+    echo "[+] 已切换国家为: $cc"
+    ;;
+  egress-test)
+    egress_test
+    ;;
+  country-test)
+    shift || true
+    if [[ $# -lt 1 ]]; then usage; exit 1; fi
+    ok=()
+    fail=()
+    for cc in "$@"; do
+      cc="${cc^^}"
+      echo "==> 测试 $cc"
+      proxyctl country "$cc" >/dev/null 2>&1
+      sleep 3
+      if out="$(egress_test 2>/dev/null)"; then
+        echo "$out"
+        ok+=("$cc")
+      else
+        echo "[-] $cc 失败"
+        fail+=("$cc")
+      fi
+      echo
+    done
+    echo "========== 汇总 =========="
+    echo "成功: ${ok[*]:-无}"
+    echo "失败: ${fail[*]:-无}"
+    ;;
+  restart)
+    systemctl restart warp-plus xray hysteria2 tuic 2>/dev/null || true
+    echo "[+] 已重启所有服务"
+    ;;
+  logs)
+    case "${2:-}" in
+      wp|warp) journalctl -u warp-plus -n 100 --no-pager ;;
+      xray) journalctl -u xray -n 100 --no-pager ;;
+      hy2|hysteria) journalctl -u hysteria2 -n 100 --no-pager ;;
+      tuic) journalctl -u tuic -n 100 --no-pager ;;
+      *) journalctl -u warp-plus -u xray -u hysteria2 -u tuic -n 100 --no-pager ;;
+    esac
+    ;;
+  *)
+    usage
+    ;;
 esac
 PROXYCTL_EOF
-chmod +x /usr/local/bin/proxyctl
-ok "proxyctl 已安装到 /usr/local/bin/proxyctl"
+  chmod +x /usr/local/bin/proxyctl
+  grn "[+] proxyctl 已安装"
+}
 
-print_client_info "$HOST" "$VLESS_PORT" "$HY2_PORT" "$TUIC_PORT" "$REALITY_SERVER" \
-  "$vless_uuid" "$tuic_uuid" "$tuic_pass" "$hy2_pass" "$hy2_obfs" "$reality_public" "$short_id" "$TLS_MODE"
-
-# install sbmenu (interactive menu)
-info "安装 sbmenu 管理菜单..."
-cat > /usr/local/bin/sbmenu <<'SBMENU_EOF'
+# ========= vpsmenu =========
+install_menu(){
+  ylw "[*] 安装菜单命令 vpsmenu..."
+  cat > /usr/local/bin/vpsmenu <<'MENU_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-need_root() {
-  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    echo "请用 root 运行：sudo sbmenu"
-    exit 1
-  fi
+while true; do
+  clear
+  cat <<MENU
+╔══════════════════════════════════════════════════════╗
+║     多协议入站 + Psiphon 出站 管理菜单               ║
+╠══════════════════════════════════════════════════════╣
+║  1) 查看服务状态        (proxyctl status)            ║
+║  2) 查看当前出口 IP     (proxyctl egress-test)       ║
+║  3) 切换出口国家        (proxyctl country <CC>)      ║
+║  4) 批量测试国家可用性  (proxyctl country-test ...)  ║
+║  5) 重启所有服务        (proxyctl restart)           ║
+║  6) 查看日志            (proxyctl logs ...)          ║
+║  0) 退出                                             ║
+╚══════════════════════════════════════════════════════╝
+MENU
+  read -r -p "请选择 [0-6]: " c || true
+  case "$c" in
+    1) proxyctl status; read -r -p "回车继续..." _ ;;
+    2) proxyctl egress-test; read -r -p "回车继续..." _ ;;
+    3) 
+      echo "常用: US JP SG DE FR GB NL HK TW KR"
+      read -r -p "国家代码: " cc
+      [[ -n "$cc" ]] && proxyctl country "$cc"
+      read -r -p "回车继续..." _ 
+      ;;
+    4) 
+      read -r -p "输入国家列表(空格分隔，如 US JP SG): " line
+      # shellcheck disable=SC2086
+      [[ -n "$line" ]] && proxyctl country-test $line
+      read -r -p "回车继续..." _ 
+      ;;
+    5) proxyctl restart; read -r -p "回车继续..." _ ;;
+    6) 
+      echo "wp=warp-plus, xray, hy2=hysteria2, tuic"
+      read -r -p "选择(默认全部): " t
+      proxyctl logs "${t:-all}"
+      read -r -p "回车继续..." _ 
+      ;;
+    0) exit 0 ;;
+  esac
+done
+MENU_EOF
+  chmod +x /usr/local/bin/vpsmenu
+  grn "[+] vpsmenu 已安装：运行 vpsmenu 打开菜单"
 }
 
-menu() {
-  while true; do
-    clear
-    echo "╔══════════════════════════════════════════════════════╗"
-    echo "║        sb-psiphon 管理菜单 (Psiphon 出站)            ║"
-    echo "╠══════════════════════════════════════════════════════╣"
-    echo "║  1) 查看服务状态        (proxyctl status)            ║"
-    echo "║  2) 查看当前出口 IP     (proxyctl egress-test)       ║"
-    echo "║  3) 切换出口国家        (proxyctl country <CC>)      ║"
-    echo "║  4) 批量测试国家可用性  (proxyctl country-test ...)  ║"
-    echo "║  5) 重启所有服务        (proxyctl restart)           ║"
-    echo "║  6) 查看服务日志                                     ║"
-    echo "║  0) 退出                                             ║"
-    echo "╚══════════════════════════════════════════════════════╝"
-    echo ""
-    read -r -p "请选择 [0-6]: " choice || true
+# ========= 输出客户端信息 =========
+print_client_info(){
+  cat <<EOF
 
-    case "${choice:-}" in
-      1) echo ""; proxyctl status; echo ""; read -r -p "按回车继续..." _ ;;
-      2) echo ""; proxyctl egress-test; echo ""; read -r -p "按回车继续..." _ ;;
-      3)
-        echo ""
-        echo "常用国家: US(美国) JP(日本) SG(新加坡) DE(德国) FR(法国) GB(英国) NL(荷兰)"
-        read -r -p "输入国家代码: " cc
-        [[ -n "$cc" ]] && proxyctl country "${cc}" || echo "未输入"
-        echo ""; read -r -p "按回车继续..." _
-        ;;
-      4)
-        echo ""; echo "示例: US JP SG DE FR GB NL"
-        read -r -p "输入国家代码列表(空格分隔): " list
-        # shellcheck disable=SC2086
-        [[ -n "$list" ]] && proxyctl country-test ${list} || echo "未输入"
-        echo ""; read -r -p "按回车继续..." _
-        ;;
-      5) echo ""; proxyctl restart; echo ""; read -r -p "按回车继续..." _ ;;
-      6)
-        echo ""; echo "1) sing-box  2) warp-plus  3) 全部"
-        read -r -p "选择: " t
-        case "${t:-}" in
-          1) journalctl -u sing-box -e --no-pager -n 50 ;;
-          2) journalctl -u warp-plus -e --no-pager -n 50 ;;
-          *) journalctl -u sing-box -u warp-plus -e --no-pager -n 50 ;;
-        esac
-        echo ""; read -r -p "按回车继续..." _
-        ;;
-      0) echo "再见！"; exit 0 ;;
-      *) echo "无效选择"; sleep 1 ;;
-    esac
-  done
+==================== 客户端参数（请妥善保存）====================
+
+[VLESS + REALITY] (Xray)
+  地址: ${HOST}
+  端口: ${VLESS_PORT} (TCP)
+  UUID: ${XRAY_UUID}
+  Flow: xtls-rprx-vision
+  SNI/ServerName: ${REALITY_SNI}
+  Reality PublicKey (pbk): ${XRAY_PUB}
+  Reality ShortID (sid): ${XRAY_SID}
+  指纹(fp): chrome
+
+  分享链接:
+  vless://${XRAY_UUID}@${HOST}:${VLESS_PORT}?encryption=none&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${XRAY_PUB}&sid=${XRAY_SID}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality
+
+[Hysteria2]
+  地址: ${HOST}
+  端口: ${HY2_PORT} (UDP)
+  密码: ${HY2_PASS}
+  OBFS: salamander
+  OBFS密码: ${HY2_OBFS}
+  证书: ${CERT_MODE} (self 模式客户端需 skip-cert-verify / insecure=true)
+
+[TUIC v5]
+  地址: ${HOST}
+  端口: ${TUIC_PORT} (UDP)
+  UUID: ${TUIC_UUID}
+  密码: ${TUIC_PASS}
+  Congestion: bbr
+  ALPN: h3
+  证书: self（客户端需 skip-cert-verify / insecure=true）
+
+===============================================================
+
+管理命令：
+  vpsmenu             # 交互式菜单
+  proxyctl status     # 查看状态
+  proxyctl country US # 切换出口国家
+  proxyctl egress-test
+  proxyctl country-test US JP SG DE FR GB
+
+EOF
 }
 
-need_root
-menu
-SBMENU_EOF
-chmod +x /usr/local/bin/sbmenu
-ok "sbmenu 管理菜单已安装"
+# ========= main =========
+main(){
+  need_root
+  local arch
+  arch="$(detect_arch)"
+  install_deps
 
-ok "安装完成！"
-echo ""
-echo "=========================================="
-echo "  管理命令："
-echo "    sbmenu          # 交互式菜单"
-echo "    proxyctl status # 命令行管理"
-echo "=========================================="
+  prompt HOST "请输入用于客户端连接的域名或IP（HOST）" "$DEFAULT_HOST"
+  prompt VLESS_PORT "VLESS+REALITY 端口(TCP)" "$DEFAULT_VLESS_PORT"
+  prompt HY2_PORT "Hysteria2 端口(UDP)" "$DEFAULT_HY2_PORT"
+  prompt TUIC_PORT "TUIC v5 端口(UDP)" "$DEFAULT_TUIC_PORT"
+  prompt REALITY_SNI "REALITY 伪装站点(需TLS1.3/H2，示例 www.apple.com)" "$DEFAULT_REALITY_SNI"
+  prompt CERT_MODE "HY2/TUIC TLS证书模式：le(自动申请) 或 self(自签)" "$DEFAULT_CERT_MODE"
+  prompt PSIPHON_COUNTRY "Psiphon 出站国家(两位代码，如 US/JP/SG/DE...)" "$DEFAULT_PSIPHON_COUNTRY"
+  prompt PSIPHON_SOCKS "Psiphon 本地 SOCKS5 端口" "$DEFAULT_PSIPHON_SOCKS"
+
+  ylw "[*] 请确保放行端口：${VLESS_PORT}/tcp, ${HY2_PORT}/udp, ${TUIC_PORT}/udp"
+
+  install_warp_plus "$arch"
+  install_xray_vless_reality "$arch"
+  install_hysteria2 "$arch"
+  install_tuic_server "$arch"
+
+  install_proxyctl
+  install_menu
+
+  print_client_info
+  grn "[+] 安装完成！"
+}
+
+main "$@"

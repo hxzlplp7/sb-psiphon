@@ -584,6 +584,61 @@ case "${1:-}" in
       *) journalctl -u psiphon -u xray -u hysteria2 -u tuic -n 100 --no-pager ;;
     esac
     ;;
+  links)
+    local f="/etc/psiphon-egress/client.json"
+    if [[ ! -f "$f" ]]; then
+      echo "[-] 未找到 $f，无法生成分享链接"
+      echo "    请重新运行安装脚本"
+      exit 1
+    fi
+
+    local host cert_mode
+    host="$(jq -r '.host' "$f")"
+    cert_mode="$(jq -r '.cert_mode' "$f")"
+
+    # VLESS+REALITY
+    local v_port v_uuid v_sni v_pbk v_sid
+    v_port="$(jq -r '.vless.port' "$f")"
+    v_uuid="$(jq -r '.vless.uuid' "$f")"
+    v_sni="$(jq -r '.vless.sni' "$f")"
+    v_pbk="$(jq -r '.vless.pbk' "$f")"
+    v_sid="$(jq -r '.vless.sid' "$f")"
+    local vless_link="vless://${v_uuid}@${host}:${v_port}?encryption=none&security=reality&sni=${v_sni}&fp=chrome&pbk=${v_pbk}&sid=${v_sid}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
+
+    # Hysteria2
+    local h_port h_auth h_obfs insecure
+    h_port="$(jq -r '.hy2.port' "$f")"
+    h_auth="$(jq -r '.hy2.auth' "$f")"
+    h_obfs="$(jq -r '.hy2.obfs_password' "$f")"
+    [[ "$cert_mode" == "self" ]] && insecure=1 || insecure=0
+    local hy2_link="hysteria2://${h_auth}@${host}:${h_port}/?obfs=salamander&obfs-password=${h_obfs}&sni=${host}&insecure=${insecure}#HY2"
+
+    # TUIC
+    local t_port t_uuid t_pass
+    t_port="$(jq -r '.tuic.port // empty' "$f")"
+    t_uuid="$(jq -r '.tuic.uuid // empty' "$f")"
+    t_pass="$(jq -r '.tuic.password // empty' "$f")"
+    local tuic_link=""
+    if [[ -n "$t_uuid" && "$t_uuid" != "null" ]]; then
+      tuic_link="tuic://${t_uuid}:${t_pass}@${host}:${t_port}?alpn=h3&udp_relay_mode=native&congestion_control=bbr&sni=${host}&allow_insecure=${insecure}#TUIC-v5"
+    fi
+
+    echo ""
+    echo "==================== 分享链接 ===================="
+    echo ""
+    echo "[VLESS+REALITY]"
+    echo "$vless_link"
+    echo ""
+    echo "[Hysteria2]"
+    echo "$hy2_link"
+    if [[ -n "$tuic_link" ]]; then
+      echo ""
+      echo "[TUIC v5]"
+      echo "$tuic_link"
+    fi
+    echo ""
+    echo "=================================================="
+    ;;
   *)
     echo "psictl - Psiphon + 多协议入站 管理工具"
     echo ""
@@ -593,6 +648,7 @@ case "${1:-}" in
     echo "  psictl egress-test          测试当前出口 IP"
     echo "  psictl country-test <CC...> 批量测试国家"
     echo "  psictl country-test-all     测试所有常用国家"
+    echo "  psictl links                查看分享链接"
     echo "  psictl restart              重启所有服务"
     echo "  psictl logs [psi|xray|hy2|tuic]"
     ;;
@@ -620,12 +676,13 @@ while true; do
 ║  3) 切换出口国家          (psictl country <CC>)      ║
 ║  4) 批量测试国家可用性    (psictl country-test ...)  ║
 ║  5) 测试所有常用国家      (psictl country-test-all)  ║
-║  6) 重启所有服务          (psictl restart)           ║
-║  7) 查看日志              (psictl logs ...)          ║
+║  6) 查看分享链接          (psictl links)             ║
+║  7) 重启所有服务          (psictl restart)           ║
+║  8) 查看日志              (psictl logs ...)          ║
 ║  0) 退出                                             ║
 ╚══════════════════════════════════════════════════════╝
 MENU
-  read -r -p "请选择 [0-7]: " c || true
+  read -r -p "请选择 [0-8]: " c || true
   case "$c" in
     1) psictl status; read -r -p "回车继续..." _ ;;
     2) psictl egress-test; read -r -p "回车继续..." _ ;;
@@ -642,8 +699,9 @@ MENU
       read -r -p "回车继续..." _
       ;;
     5) psictl country-test-all; read -r -p "回车继续..." _ ;;
-    6) psictl restart; read -r -p "回车继续..." _ ;;
-    7)
+    6) psictl links; read -r -p "回车继续..." _ ;;
+    7) psictl restart; read -r -p "回车继续..." _ ;;
+    8)
       echo "psi=psiphon, xray, hy2=hysteria2, tuic"
       read -r -p "选择(默认全部): " t
       psictl logs "${t:-all}"
@@ -657,8 +715,62 @@ MENU_EOF
   grn "[+] vpsmenu 已安装：运行 vpsmenu 打开菜单"
 }
 
+# ========= 保存客户端参数到 JSON =========
+save_client_json(){
+  mkdir -p /etc/psiphon-egress
+  
+  local insecure=0
+  [[ "$CERT_MODE" == "self" ]] && insecure=1
+
+  cat >/etc/psiphon-egress/client.json <<EOF
+{
+  "host": "${HOST}",
+  "cert_mode": "${CERT_MODE}",
+  "vless": {
+    "port": ${VLESS_PORT},
+    "uuid": "${XRAY_UUID}",
+    "flow": "xtls-rprx-vision",
+    "sni": "${REALITY_SNI}",
+    "fp": "chrome",
+    "pbk": "${XRAY_PUB}",
+    "sid": "${XRAY_SID}"
+  },
+  "hy2": {
+    "port": ${HY2_PORT},
+    "auth": "${HY2_PASS}",
+    "obfs": "salamander",
+    "obfs_password": "${HY2_OBFS}",
+    "insecure": ${insecure}
+  },
+  "tuic": {
+    "port": ${TUIC_PORT},
+    "uuid": "${TUIC_UUID:-}",
+    "password": "${TUIC_PASS:-}",
+    "congestion_control": "bbr",
+    "alpn": "h3",
+    "insecure": ${insecure}
+  }
+}
+EOF
+  chmod 600 /etc/psiphon-egress/client.json
+}
+
 # ========= 输出客户端信息 =========
 print_client_info(){
+  # 先保存参数到 JSON
+  save_client_json
+
+  local insecure=0
+  [[ "$CERT_MODE" == "self" ]] && insecure=1
+
+  # 生成分享链接
+  local vless_link="vless://${XRAY_UUID}@${HOST}:${VLESS_PORT}?encryption=none&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${XRAY_PUB}&sid=${XRAY_SID}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
+  local hy2_link="hysteria2://${HY2_PASS}@${HOST}:${HY2_PORT}/?obfs=salamander&obfs-password=${HY2_OBFS}&sni=${HOST}&insecure=${insecure}#HY2"
+  local tuic_link=""
+  if [[ -n "${TUIC_UUID:-}" ]]; then
+    tuic_link="tuic://${TUIC_UUID}:${TUIC_PASS}@${HOST}:${TUIC_PORT}?alpn=h3&udp_relay_mode=native&congestion_control=bbr&sni=${HOST}&allow_insecure=${insecure}#TUIC-v5"
+  fi
+
   cat <<EOF
 
 ==================== 客户端参数（请妥善保存）====================
@@ -667,22 +779,15 @@ print_client_info(){
   地址: ${HOST}
   端口: ${VLESS_PORT} (TCP)
   UUID: ${XRAY_UUID}
-  Flow: xtls-rprx-vision
-  SNI/ServerName: ${REALITY_SNI}
-  Reality PublicKey (pbk): ${XRAY_PUB}
-  Reality ShortID (sid): ${XRAY_SID}
-  指纹(fp): chrome
-
-  分享链接:
-  vless://${XRAY_UUID}@${HOST}:${VLESS_PORT}?encryption=none&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${XRAY_PUB}&sid=${XRAY_SID}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality
+  SNI: ${REALITY_SNI}
+  pbk: ${XRAY_PUB}
+  sid: ${XRAY_SID}
 
 [Hysteria2]
   地址: ${HOST}
   端口: ${HY2_PORT} (UDP)
   密码: ${HY2_PASS}
-  OBFS: salamander
   OBFS密码: ${HY2_OBFS}
-  证书: ${CERT_MODE} (self 模式客户端需 skip-cert-verify / insecure=true)
 
 EOF
 
@@ -693,9 +798,25 @@ EOF
   端口: ${TUIC_PORT} (UDP)
   UUID: ${TUIC_UUID}
   密码: ${TUIC_PASS}
-  Congestion: bbr
-  ALPN: h3
-  证书: self（客户端需 skip-cert-verify / insecure=true）
+
+EOF
+  fi
+
+  cat <<EOF
+==================== 分享链接（可直接导入客户端）====================
+
+[VLESS+REALITY]
+${vless_link}
+
+[Hysteria2]
+${hy2_link}
+
+EOF
+
+  if [[ -n "$tuic_link" ]]; then
+    cat <<EOF
+[TUIC v5]
+${tuic_link}
 
 EOF
   fi
@@ -705,10 +826,10 @@ EOF
 
 管理命令：
   vpsmenu                  # 交互式菜单
+  psictl links             # 查看分享链接
   psictl status            # 查看 Psiphon 状态
   psictl country US        # 切换出口国家
   psictl egress-test       # 测试当前出口
-  psictl country-test US JP SG DE
   psictl country-test-all  # 测试所有常用国家
 
 EOF

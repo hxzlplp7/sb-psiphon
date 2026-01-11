@@ -496,6 +496,62 @@ REGION="$(jq -r '.EgressRegion // ""' "$CFG" 2>/dev/null || echo "")"
 # 常用可用国家码
 ALL=(AT BE BG CA CH CZ DE DK EE ES FI FR GB HU IE IN IT JP LV NL NO PL RO RS SE SG SK US)
 
+# =========================
+# 国家代码 -> 中文名 + 大洲（离线映射）
+# =========================
+declare -A CC_ZH CC_CONT
+
+# --- 欧洲 ---
+CC_ZH[AT]="奥地利";   CC_CONT[AT]="欧洲"
+CC_ZH[BE]="比利时";   CC_CONT[BE]="欧洲"
+CC_ZH[BG]="保加利亚"; CC_CONT[BG]="欧洲"
+CC_ZH[CH]="瑞士";     CC_CONT[CH]="欧洲"
+CC_ZH[CZ]="捷克";     CC_CONT[CZ]="欧洲"
+CC_ZH[DE]="德国";     CC_CONT[DE]="欧洲"
+CC_ZH[DK]="丹麦";     CC_CONT[DK]="欧洲"
+CC_ZH[EE]="爱沙尼亚"; CC_CONT[EE]="欧洲"
+CC_ZH[ES]="西班牙";   CC_CONT[ES]="欧洲"
+CC_ZH[FI]="芬兰";     CC_CONT[FI]="欧洲"
+CC_ZH[FR]="法国";     CC_CONT[FR]="欧洲"
+CC_ZH[GB]="英国";     CC_CONT[GB]="欧洲"
+CC_ZH[HU]="匈牙利";   CC_CONT[HU]="欧洲"
+CC_ZH[IE]="爱尔兰";   CC_CONT[IE]="欧洲"
+CC_ZH[IT]="意大利";   CC_CONT[IT]="欧洲"
+CC_ZH[LV]="拉脱维亚"; CC_CONT[LV]="欧洲"
+CC_ZH[NL]="荷兰";     CC_CONT[NL]="欧洲"
+CC_ZH[NO]="挪威";     CC_CONT[NO]="欧洲"
+CC_ZH[PL]="波兰";     CC_CONT[PL]="欧洲"
+CC_ZH[RO]="罗马尼亚"; CC_CONT[RO]="欧洲"
+CC_ZH[RS]="塞尔维亚"; CC_CONT[RS]="欧洲"
+CC_ZH[SE]="瑞典";     CC_CONT[SE]="欧洲"
+CC_ZH[SK]="斯洛伐克"; CC_CONT[SK]="欧洲"
+
+# --- 亚洲 ---
+CC_ZH[IN]="印度";     CC_CONT[IN]="亚洲"
+CC_ZH[JP]="日本";     CC_CONT[JP]="亚洲"
+CC_ZH[SG]="新加坡";   CC_CONT[SG]="亚洲"
+CC_ZH[HK]="香港";     CC_CONT[HK]="亚洲"
+CC_ZH[TW]="台湾";     CC_CONT[TW]="亚洲"
+CC_ZH[KR]="韩国";     CC_CONT[KR]="亚洲"
+
+# --- 北美洲 ---
+CC_ZH[CA]="加拿大";   CC_CONT[CA]="北美洲"
+CC_ZH[US]="美国";     CC_CONT[US]="北美洲"
+
+# 国家代码转可读标签：US -> US 美国（北美洲）
+cc_label() {
+  local cc="${1^^}"
+  local zh="${CC_ZH[$cc]:-}"
+  local cont="${CC_CONT[$cc]:-}"
+  if [[ -n "$zh" && -n "$cont" ]]; then
+    echo "$cc $zh（$cont）"
+  elif [[ -n "$zh" ]]; then
+    echo "$cc $zh"
+  else
+    echo "$cc"
+  fi
+}
+
 set_region() {
   local cc="$1"
   local tmp
@@ -522,7 +578,11 @@ egress_test() {
 
 case "${1:-}" in
   status)
-    echo "EgressRegion: ${REGION:-AUTO}"
+    if [[ -n "$REGION" ]]; then
+      echo "EgressRegion: $(cc_label "$REGION")"
+    else
+      echo "EgressRegion: AUTO（自动选择）"
+    fi
     echo "SOCKS: 127.0.0.1:${SOCKS_PORT}"
     echo ""
     systemctl --no-pager -l status psiphon 2>/dev/null || echo "未运行"
@@ -530,7 +590,11 @@ case "${1:-}" in
   country)
     [[ -n "${2:-}" ]] || { echo "用法: psictl country <CC|AUTO>"; exit 1; }
     set_region "$2"
-    echo "[+] 已切换国家为: ${2^^}"
+    if [[ "${2^^}" == "AUTO" ]]; then
+      echo "[+] 已切换为: AUTO（自动选择最佳出口）"
+    else
+      echo "[+] 已切换为: $(cc_label "${2^^}")"
+    fi
     ;;
   egress-test)
     egress_test
@@ -540,17 +604,17 @@ case "${1:-}" in
     [[ $# -ge 1 ]] || { echo "用法: psictl country-test <CC...>"; exit 1; }
     ok=(); fail=(); mismatch=()
     for cc in "$@"; do
-      echo "==> ${cc^^}"
+      echo "==> $(cc_label "${cc^^}")"
       set_region "$cc" >/dev/null 2>&1
       json="$(curl -fsS --max-time 12 --socks5-hostname "127.0.0.1:${SOCKS_PORT}" https://ipinfo.io/json 2>/dev/null || true)"
       if [[ -z "$json" ]]; then
-        echo "  [-] FAIL (no response)"
+        echo "  [-] FAIL (无响应)"
         fail+=("${cc^^}")
         continue
       fi
       got="$(echo "$json" | jq -r '.country // empty' 2>/dev/null || true)"
       if [[ -z "$got" ]]; then
-        echo "  [~] MISMATCH (no country field)"
+        echo "  [~] MISMATCH (无country字段)"
         mismatch+=("${cc^^}")
         continue
       fi
@@ -558,7 +622,7 @@ case "${1:-}" in
         echo "  [+] OK (country=${got^^})"
         ok+=("${cc^^}")
       else
-        echo "  [~] MISMATCH (want=${cc^^} got=${got^^})"
+        echo "  [~] MISMATCH (期望=${cc^^} 实际=${got^^})"
         mismatch+=("${cc^^}")
       fi
     done
@@ -664,7 +728,7 @@ case "${1:-}" in
     echo "========== 可用国家（按编号选择）=========="
     i=1
     for cc in "${ok_arr[@]}"; do
-      printf "  %2d) %s\n" "$i" "$cc"
+      printf "  %2d) %s\n" "$i" "$(cc_label "$cc")"
       i=$((i+1))
     done
     echo "   0) 取消"

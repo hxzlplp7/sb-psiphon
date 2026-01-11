@@ -102,11 +102,17 @@ rand_hex(){
 
 download_file(){
   local url="$1" dest="$2"
+  # 先下载到 /tmp，避免直接写 /usr/local/bin 导致 curl 23 错误
+  local tmp
+  tmp="$(mktemp -p /tmp download.XXXXXX)"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$dest"
+    curl -fsSL --retry 3 "$url" -o "$tmp"
   else
-    wget -qO "$dest" "$url"
+    wget -qO "$tmp" "$url"
   fi
+  # 使用 install 命令移动到目标位置
+  install -m 0755 "$tmp" "$dest"
+  rm -f "$tmp"
 }
 
 download_latest_github_release_asset(){

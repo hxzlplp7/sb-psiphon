@@ -23,6 +23,30 @@ need_root(){
   fi
 }
 
+# 确保 curl 可用（脚本后续需要 curl）
+ensure_curl(){
+  if command -v curl >/dev/null 2>&1; then
+    return 0
+  fi
+  ylw "[*] 检测到 curl 未安装，正在安装..."
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y curl >/dev/null 2>&1
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf -y install curl >/dev/null 2>&1
+  elif command -v yum >/dev/null 2>&1; then
+    yum -y install curl >/dev/null 2>&1
+  else
+    red "无法自动安装 curl，请手动安装后重试"
+    exit 1
+  fi
+  grn "[+] curl 已安装"
+}
+
+# 入口点先确保 curl 可用
+need_root
+ensure_curl
+
 detect_arch(){
   local a
   a="$(uname -m)"
@@ -631,7 +655,6 @@ EOF
 
 # ========= main =========
 main(){
-  need_root
   local arch
   arch="$(detect_arch)"
   install_deps

@@ -63,9 +63,17 @@
 
 ### 方式一：一键安装（推荐）
 
+**使用 curl：**
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/hxzlplp7/sb-psiphon/main/install.sh)
 ```
+
+**使用 wget（如果没有 curl）：**
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/hxzlplp7/sb-psiphon/main/install.sh)
+```
+
+> **提示**：脚本会自动检测并安装 curl（后续步骤需要），如果系统没有 curl 也没关系。
 
 ### 方式二：克隆仓库
 
@@ -196,8 +204,14 @@ A:
 
 ## 卸载
 
+**使用 curl：**
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/hxzlplp7/sb-psiphon/main/uninstall.sh)
+```
+
+**使用 wget：**
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/hxzlplp7/sb-psiphon/main/uninstall.sh)
 ```
 
 或本地执行：

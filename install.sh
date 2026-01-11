@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ========= 可调默认值 =========
-DEFAULT_HOST="example.com"
+# HOST 会在安装时自动探测公网 IP
 DEFAULT_VLESS_PORT="443"
 DEFAULT_HY2_PORT="8443"
 DEFAULT_TUIC_PORT="2053"
@@ -993,6 +993,21 @@ main(){
   local arch
   arch="$(detect_arch)"
   install_deps
+
+  # 自动探测公网 IP
+  ylw "[*] 正在探测本机公网 IP..."
+  local detected_ip=""
+  detected_ip="$(curl -fsS --max-time 6 https://api64.ipify.org 2>/dev/null || true)"
+  [[ -z "$detected_ip" ]] && detected_ip="$(curl -fsS --max-time 6 https://ifconfig.me/ip 2>/dev/null || true)"
+  [[ -z "$detected_ip" ]] && detected_ip="$(curl -fsS --max-time 6 https://ipinfo.io/ip 2>/dev/null || true)"
+  
+  if [[ -n "$detected_ip" ]]; then
+    grn "[+] 探测到公网 IP: $detected_ip"
+    DEFAULT_HOST="$detected_ip"
+  else
+    ylw "[!] 无法自动探测公网 IP，请手动输入"
+    DEFAULT_HOST="example.com"
+  fi
 
   prompt HOST "请输入用于客户端连接的域名或IP（HOST）" "$DEFAULT_HOST"
   prompt VLESS_PORT "VLESS+REALITY 端口(TCP)" "$DEFAULT_VLESS_PORT"

@@ -47,7 +47,13 @@
 
 ## 快速开始
 
-### 一键安装
+### 方式一：一键安装（推荐）
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/hxzlplp7/sb-psiphon/main/install.sh)
+```
+
+### 方式二：克隆仓库
 
 ```bash
 sudo -i

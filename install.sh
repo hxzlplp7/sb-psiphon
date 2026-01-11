@@ -459,9 +459,184 @@ write_singbox_config "$HOST" "$VLESS_PORT" "$HY2_PORT" "$TUIC_PORT" "$CERT_PATH"
 
 restart_singbox
 
-# install proxyctl
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-install -m 0755 "${SCRIPT_DIR}/proxyctl" /usr/local/bin/proxyctl
+# install proxyctl (embedded for curl|bash support)
+info "安装 proxyctl 管理命令..."
+cat > /usr/local/bin/proxyctl <<'PROXYCTL_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+WARPPLUS_ENV="/etc/warp-plus/warp-plus.env"
+SB_CONFIG="/etc/sing-box/config.json"
+
+usage() {
+  cat <<'EOF'
+proxyctl - sing-box + warp-plus (Psiphon) 管理工具
+
+用法:
+  proxyctl status               查看 warp-plus 和 sing-box 运行状态
+  proxyctl country <CC>         切换 Psiphon 出站国家 (例如 US / JP / SG / DE)
+  proxyctl egress-test          测试当前出口 IP 归属国家
+  proxyctl country-test <CC...> 批量测试哪些国家能成功出站
+  proxyctl restart              重启 warp-plus 和 sing-box
+  proxyctl logs [sb|wp]         查看日志 (sb=sing-box, wp=warp-plus)
+EOF
+}
+
+must_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    echo "请用 root 运行：sudo proxyctl ..."
+    exit 1
+  fi
+}
+
+get_socks_port() {
+  local bind
+  bind="$(grep -E '^SOCKS_BIND=' "$WARPPLUS_ENV" | cut -d= -f2- || true)"
+  echo "${bind##*:}"
+}
+
+get_current_country() {
+  grep -E '^COUNTRY=' "$WARPPLUS_ENV" | cut -d= -f2- || echo "未知"
+}
+
+status() {
+  echo "========== warp-plus 状态 =========="
+  echo "  当前国家: $(get_current_country)"
+  echo "  SOCKS端口: $(get_socks_port)"
+  systemctl --no-pager -l status warp-plus 2>/dev/null || echo "  服务未运行或未安装"
+  echo ""
+  echo "========== sing-box 状态 =========="
+  systemctl --no-pager -l status sing-box 2>/dev/null || echo "  服务未运行或未安装"
+}
+
+restart_all() {
+  echo "重启 warp-plus..."
+  systemctl restart warp-plus 2>/dev/null || echo "warp-plus 重启失败"
+  echo "重启 sing-box..."
+  systemctl restart sing-box 2>/dev/null || echo "sing-box 重启失败"
+  echo "已重启 warp-plus & sing-box"
+}
+
+set_country() {
+  local cc="$1"
+  [[ -n "$cc" ]] || { echo "缺少国家代码"; exit 1; }
+  cc="${cc^^}"
+  sed -i "s/^COUNTRY=.*/COUNTRY=${cc}/" "$WARPPLUS_ENV"
+  systemctl restart warp-plus
+  echo "已切换 Psiphon 国家为 ${cc}，等待服务就绪..."
+  sleep 2
+}
+
+egress_test() {
+  local port; port="$(get_socks_port)"
+  echo "[egress-test] SOCKS5 -> 127.0.0.1:${port}"
+  echo "当前设置国家: $(get_current_country)"
+  echo ""
+  
+  local result
+  if command -v curl >/dev/null 2>&1; then
+    result="$(curl -fsS --max-time 10 --socks5-hostname "127.0.0.1:${port}" https://ipinfo.io/json 2>/dev/null)" \
+      || result="$(curl -fsS --max-time 10 --socks5-hostname "127.0.0.1:${port}" https://ifconfig.co/json 2>/dev/null)" \
+      || result="$(curl -fsS --max-time 10 --socks5-hostname "127.0.0.1:${port}" https://ipapi.co/json 2>/dev/null)" \
+      || { echo "出口测试失败：无法通过 SOCKS 拉取外网信息"; exit 2; }
+    
+    echo "$result" | jq . 2>/dev/null || echo "$result"
+  else
+    echo "缺少 curl"
+    exit 1
+  fi
+  echo ""
+}
+
+country_test() {
+  shift || true
+  local codes=("$@")
+  if [[ "${#codes[@]}" -eq 0 ]]; then
+    echo "请提供国家代码列表，例如：proxyctl country-test US JP SG DE FR GB"
+    exit 1
+  fi
+
+  local port; port="$(get_socks_port)"
+  echo "[country-test] 使用 SOCKS 端口 127.0.0.1:${port}"
+  echo "将逐个切换 warp-plus 国家并测试出口归属"
+  echo ""
+
+  local success=()
+  local failed=()
+  local mismatch=()
+
+  for cc in "${codes[@]}"; do
+    cc="${cc^^}"
+    echo "==> 测试 ${cc}"
+    set_country "$cc" >/dev/null 2>&1
+    sleep 3
+
+    local json country
+    json="$( (curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${port}" https://ipinfo.io/json 2>/dev/null \
+              || curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${port}" https://ifconfig.co/json 2>/dev/null \
+              || curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${port}" https://ipapi.co/json 2>/dev/null) || true )"
+
+    if [[ -z "$json" ]]; then
+      echo "  [-] ${cc} 失败（无响应）"
+      failed+=("$cc")
+      continue
+    fi
+
+    if command -v jq >/dev/null 2>&1; then
+      country="$(echo "$json" | jq -r '.country // .country_code // .country_iso // empty' 2>/dev/null || true)"
+    else
+      country=""
+    fi
+
+    if [[ -n "$country" ]]; then
+      if [[ "${country^^}" == "${cc}" ]]; then
+        echo "  [+] ${cc} 成功（country=${country}）"
+        success+=("$cc")
+      else
+        echo "  [~] ${cc} 有响应但归属不一致（country=${country}）"
+        mismatch+=("${cc}→${country}")
+      fi
+    else
+      echo "  [~] ${cc} 有响应但解析不到 country 字段"
+      mismatch+=("${cc}→?")
+    fi
+  done
+
+  echo ""
+  echo "========== 测试结果汇总 =========="
+  echo "  成功: ${success[*]:-无}"
+  echo "  失败: ${failed[*]:-无}"
+  echo "  归属不一致: ${mismatch[*]:-无}"
+}
+
+show_logs() {
+  local target="${1:-all}"
+  case "$target" in
+    sb|singbox|sing-box)
+      journalctl -u sing-box -f --no-pager
+      ;;
+    wp|warp|warp-plus)
+      journalctl -u warp-plus -f --no-pager
+      ;;
+    *)
+      echo "同时显示 warp-plus 和 sing-box 日志（Ctrl+C 退出）"
+      journalctl -u warp-plus -u sing-box -f --no-pager
+      ;;
+  esac
+}
+
+case "${1:-}" in
+  status) must_root; status ;;
+  restart) must_root; restart_all ;;
+  country) must_root; set_country "${2:-}" ;;
+  egress-test) must_root; egress_test ;;
+  country-test) must_root; country_test "$@" ;;
+  logs) must_root; show_logs "${2:-}" ;;
+  *) usage; exit 0 ;;
+esac
+PROXYCTL_EOF
+chmod +x /usr/local/bin/proxyctl
+ok "proxyctl 已安装到 /usr/local/bin/proxyctl"
 
 print_client_info "$HOST" "$VLESS_PORT" "$HY2_PORT" "$TUIC_PORT" "$REALITY_SERVER" \
   "$vless_uuid" "$tuic_uuid" "$tuic_pass" "$hy2_pass" "$hy2_obfs" "$reality_public" "$short_id" "$TLS_MODE"

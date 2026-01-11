@@ -226,13 +226,34 @@ install_xray_vless_reality(){
   mkdir -p /usr/local/share/xray
   cp -f /tmp/xray/*.dat /usr/local/share/xray/ 2>/dev/null || true
 
-  # 生成 REALITY keypair
+  # 生成 REALITY keypair（带验证和重试）
   local keypair priv pub sid uuid
-  keypair="$(/usr/local/bin/xray x25519)"
-  priv="$(echo "$keypair" | awk -F': ' '/Private key/ {print $2}')"
-  pub="$(echo "$keypair" | awk -F': ' '/Public key/ {print $2}')"
+  local retry=0
+  while [[ $retry -lt 3 ]]; do
+    keypair="$(/usr/local/bin/xray x25519 2>&1)"
+    priv="$(echo "$keypair" | awk -F': ' '/Private key/ {print $2; exit}')"
+    pub="$(echo "$keypair" | awk -F': ' '/Public key/ {print $2; exit}')"
+    if [[ -n "$priv" && -n "$pub" && ${#priv} -gt 20 && ${#pub} -gt 20 ]]; then
+      break
+    fi
+    retry=$((retry+1))
+    ylw "[!] x25519 密钥生成失败，重试 $retry/3..."
+    sleep 1
+  done
+
+  if [[ -z "$priv" || -z "$pub" || ${#priv} -lt 20 ]]; then
+    red "[!] REALITY 密钥生成失败，xray x25519 输出："
+    echo "$keypair"
+    red "[!] 请手动运行 /usr/local/bin/xray x25519 检查"
+    exit 1
+  fi
+
   sid="$(rand_hex 8)"
   uuid="$(gen_uuid)"
+
+  grn "[+] REALITY 密钥生成成功"
+  grn "    PrivateKey: ${priv:0:10}..."
+  grn "    PublicKey:  ${pub:0:10}..."
 
   mkdir -p /etc/xray
   cat > /etc/xray/config.json <<EOF

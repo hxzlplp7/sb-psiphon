@@ -7,6 +7,7 @@ DEFAULT_VLESS_PORT="443"
 DEFAULT_HY2_PORT="8443"
 DEFAULT_TUIC_PORT="2053"
 DEFAULT_REALITY_SNI="www.apple.com"
+DEFAULT_QUIC_SNI="www.bing.com"    
 DEFAULT_CERT_MODE="self"   # self | le
 DEFAULT_PSIPHON_REGION="US"
 DEFAULT_PSIPHON_SOCKS="1081"
@@ -368,6 +369,8 @@ acme:
   domains:
     - ${HOST}
   email: admin@${HOST}
+tls:
+  sniGuard: strict
 auth:
   type: password
   password: ${hy_pass}
@@ -387,6 +390,7 @@ listen: :${HY2_PORT}
 tls:
   cert: /etc/ssl/sbox/self.crt
   key: /etc/ssl/sbox/self.key
+  sniGuard: disable
 auth:
   type: password
   password: ${hy_pass}
@@ -698,21 +702,23 @@ case "${1:-}" in
     local vless_link="vless://${v_uuid}@${host}:${v_port}?encryption=none&security=reality&sni=${v_sni}&fp=chrome&pbk=${v_pbk}&sid=${v_sid}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
 
     # Hysteria2
-    local h_port h_auth h_obfs insecure
+    local h_port h_auth h_obfs h_sni insecure
     h_port="$(jq -r '.hy2.port' "$f")"
     h_auth="$(jq -r '.hy2.auth' "$f")"
     h_obfs="$(jq -r '.hy2.obfs_password' "$f")"
+    h_sni="$(jq -r '.hy2.sni // "www.bing.com"' "$f")"
     [[ "$cert_mode" == "self" ]] && insecure=1 || insecure=0
-    local hy2_link="hysteria2://${h_auth}@${host}:${h_port}/?obfs=salamander&obfs-password=${h_obfs}&sni=${host}&insecure=${insecure}#HY2"
+    local hy2_link="hysteria2://${h_auth}@${host}:${h_port}/?obfs=salamander&obfs-password=${h_obfs}&sni=${h_sni}&insecure=${insecure}&alpn=h3#HY2"
 
     # TUIC
-    local t_port t_uuid t_pass
+    local t_port t_uuid t_pass t_sni
     t_port="$(jq -r '.tuic.port // empty' "$f")"
     t_uuid="$(jq -r '.tuic.uuid // empty' "$f")"
     t_pass="$(jq -r '.tuic.password // empty' "$f")"
+    t_sni="$(jq -r '.tuic.sni // "www.bing.com"' "$f")"
     local tuic_link=""
     if [[ -n "$t_uuid" && "$t_uuid" != "null" ]]; then
-      tuic_link="tuic://${t_uuid}:${t_pass}@${host}:${t_port}?alpn=h3&udp_relay_mode=native&congestion_control=bbr&sni=${host}&allow_insecure=${insecure}#TUIC-v5"
+      tuic_link="tuic://${t_uuid}:${t_pass}@${host}:${t_port}?alpn=h3&udp_relay_mode=native&congestion_control=bbr&sni=${t_sni}&allow_insecure=${insecure}#TUIC-v5"
     fi
 
     echo ""
@@ -894,6 +900,7 @@ save_client_json(){
     "auth": "${HY2_PASS}",
     "obfs": "salamander",
     "obfs_password": "${HY2_OBFS}",
+    "sni": "${QUIC_SNI}",
     "insecure": ${insecure}
   },
   "tuic": {
@@ -902,6 +909,7 @@ save_client_json(){
     "password": "${TUIC_PASS:-}",
     "congestion_control": "bbr",
     "alpn": "h3",
+    "sni": "${QUIC_SNI}",
     "insecure": ${insecure}
   }
 }
@@ -917,12 +925,12 @@ print_client_info(){
   local insecure=0
   [[ "$CERT_MODE" == "self" ]] && insecure=1
 
-  # 生成分享链接
+  # 生成分享链接（HY2/TUIC 使用伪装站点 SNI）
   local vless_link="vless://${XRAY_UUID}@${HOST}:${VLESS_PORT}?encryption=none&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${XRAY_PUB}&sid=${XRAY_SID}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
-  local hy2_link="hysteria2://${HY2_PASS}@${HOST}:${HY2_PORT}/?obfs=salamander&obfs-password=${HY2_OBFS}&sni=${HOST}&insecure=${insecure}#HY2"
+  local hy2_link="hysteria2://${HY2_PASS}@${HOST}:${HY2_PORT}/?obfs=salamander&obfs-password=${HY2_OBFS}&sni=${QUIC_SNI}&insecure=${insecure}&alpn=h3#HY2"
   local tuic_link=""
   if [[ -n "${TUIC_UUID:-}" ]]; then
-    tuic_link="tuic://${TUIC_UUID}:${TUIC_PASS}@${HOST}:${TUIC_PORT}?alpn=h3&udp_relay_mode=native&congestion_control=bbr&sni=${HOST}&allow_insecure=${insecure}#TUIC-v5"
+    tuic_link="tuic://${TUIC_UUID}:${TUIC_PASS}@${HOST}:${TUIC_PORT}?alpn=h3&udp_relay_mode=native&congestion_control=bbr&sni=${QUIC_SNI}&allow_insecure=${insecure}#TUIC-v5"
   fi
 
   cat <<EOF
@@ -1018,6 +1026,7 @@ main(){
   prompt HY2_PORT "Hysteria2 端口(UDP)" "$DEFAULT_HY2_PORT"
   prompt TUIC_PORT "TUIC v5 端口(UDP)" "$DEFAULT_TUIC_PORT"
   prompt REALITY_SNI "REALITY 伪装站点(需TLS1.3/H2，示例 www.apple.com)" "$DEFAULT_REALITY_SNI"
+  prompt QUIC_SNI "HY2/TUIC 伪装站点SNI" "$DEFAULT_QUIC_SNI"
   prompt CERT_MODE "HY2/TUIC TLS证书模式：le(自动申请) 或 self(自签)" "$DEFAULT_CERT_MODE"
   prompt PSIPHON_REGION "Psiphon 出站国家(两位代码，如 US/JP/SG/DE，AUTO=自动)" "$DEFAULT_PSIPHON_REGION"
   prompt PSIPHON_SOCKS "Psiphon 本地 SOCKS5 端口" "$DEFAULT_PSIPHON_SOCKS"

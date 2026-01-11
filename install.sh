@@ -321,7 +321,7 @@ install_xray_vless_reality(){
 
   ylw "[*] 安装 Xray-core（VLESS+REALITY）..."
   local url
-  if [[ "$arch" == "x86_64" ]]; then
+  if [[ "$arch" == "amd64" ]]; then
     url="$(download_latest_github_release_asset "XTLS/Xray-core" "Xray-linux-64.zip")"
   elif [[ "$arch" == "arm64" ]]; then
     url="$(download_latest_github_release_asset "XTLS/Xray-core" "Xray-linux-arm64-v8a.zip")"
@@ -448,7 +448,7 @@ install_hysteria2(){
 
   ylw "[*] 安装 Hysteria2..."
   local url
-  if [[ "$arch" == "x86_64" ]]; then
+  if [[ "$arch" == "amd64" ]]; then
     url="$(download_latest_github_release_asset "apernet/hysteria" "hysteria-linux-amd64$")"
   elif [[ "$arch" == "arm64" ]]; then
     url="$(download_latest_github_release_asset "apernet/hysteria" "hysteria-linux-arm64$")"
@@ -547,8 +547,8 @@ install_tuic_server(){
   arch="$(detect_arch)"
 
   ylw "[*] 安装 tuic-server..."
-  local url
-  if [[ "$arch" == "x86_64" ]]; then
+  local url=""
+  if [[ "$arch" == "amd64" ]]; then
     url="$(download_latest_github_release_asset "EAimTY/tuic" "tuic-server.*x86_64.*linux" || true)"
   elif [[ "$arch" == "arm64" ]]; then
     url="$(download_latest_github_release_asset "EAimTY/tuic" "tuic-server.*aarch64.*linux" || true)"
@@ -558,9 +558,9 @@ install_tuic_server(){
     ylw "[!] 未能获取 tuic-server，尝试备用方式..."
     local api="https://api.github.com/repos/EAimTY/tuic/releases"
     if command -v curl >/dev/null 2>&1; then
-      if [[ "$arch" == "x86_64" ]]; then
+      if [[ "$arch" == "amd64" ]]; then
         url="$(curl -fsSL "$api" | jq -r '.[0].assets[].browser_download_url' | grep -i "tuic-server.*x86_64.*linux" | head -n1 || true)"
-      else
+      elif [[ "$arch" == "arm64" ]]; then
         url="$(curl -fsSL "$api" | jq -r '.[0].assets[].browser_download_url' | grep -i "tuic-server.*aarch64.*linux" | head -n1 || true)"
       fi
     fi

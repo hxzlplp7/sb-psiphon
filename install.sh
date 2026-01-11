@@ -718,6 +718,65 @@ egress_test() {
   echo "$json" | jq -r '"IP: \(.ip)\nCountry: \(.country)\nOrg: \(.org)\nCity: \(.city)"'
 }
 
+# 分享链接生成函数
+show_links() {
+  local f="/etc/psiphon-egress/client.json"
+  if [[ ! -f "$f" ]]; then
+    echo "[-] 未找到 $f，无法生成分享链接"
+    echo "    请重新运行安装脚本"
+    exit 1
+  fi
+
+  local host cert_mode
+  host="$(jq -r '.host' "$f")"
+  cert_mode="$(jq -r '.cert_mode' "$f")"
+
+  # VLESS+REALITY
+  local v_port v_uuid v_sni v_pbk v_sid
+  v_port="$(jq -r '.vless.port' "$f")"
+  v_uuid="$(jq -r '.vless.uuid' "$f")"
+  v_sni="$(jq -r '.vless.sni' "$f")"
+  v_pbk="$(jq -r '.vless.pbk' "$f")"
+  v_sid="$(jq -r '.vless.sid' "$f")"
+  local vless_link="vless://${v_uuid}@${host}:${v_port}?encryption=none&security=reality&sni=${v_sni}&fp=chrome&pbk=${v_pbk}&sid=${v_sid}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
+
+  # Hysteria2
+  local h_port h_auth h_obfs h_sni insecure
+  h_port="$(jq -r '.hy2.port' "$f")"
+  h_auth="$(jq -r '.hy2.auth' "$f")"
+  h_obfs="$(jq -r '.hy2.obfs_password' "$f")"
+  h_sni="$(jq -r '.hy2.sni // "www.bing.com"' "$f")"
+  [[ "$cert_mode" == "self" ]] && insecure=1 || insecure=0
+  local hy2_link="hysteria2://${h_auth}@${host}:${h_port}/?obfs=salamander&obfs-password=${h_obfs}&sni=${h_sni}&insecure=${insecure}&alpn=h3#HY2"
+
+  # TUIC
+  local t_port t_uuid t_pass t_sni
+  t_port="$(jq -r '.tuic.port // empty' "$f")"
+  t_uuid="$(jq -r '.tuic.uuid // empty' "$f")"
+  t_pass="$(jq -r '.tuic.password // empty' "$f")"
+  t_sni="$(jq -r '.tuic.sni // "www.bing.com"' "$f")"
+  local tuic_link=""
+  if [[ -n "$t_uuid" && "$t_uuid" != "null" ]]; then
+    tuic_link="tuic://${t_uuid}:${t_pass}@${host}:${t_port}?alpn=h3&udp_relay_mode=native&congestion_control=bbr&sni=${t_sni}&allow_insecure=${insecure}#TUIC-v5"
+  fi
+
+  echo ""
+  echo "==================== 分享链接 ===================="
+  echo ""
+  echo "[VLESS+REALITY]"
+  echo "$vless_link"
+  echo ""
+  echo "[Hysteria2]"
+  echo "$hy2_link"
+  if [[ -n "$tuic_link" ]]; then
+    echo ""
+    echo "[TUIC v5]"
+    echo "$tuic_link"
+  fi
+  echo ""
+  echo "=================================================="
+}
+
 case "${1:-}" in
   status)
     if [[ -n "$REGION" ]]; then
@@ -791,61 +850,7 @@ case "${1:-}" in
     esac
     ;;
   links)
-    local f="/etc/psiphon-egress/client.json"
-    if [[ ! -f "$f" ]]; then
-      echo "[-] 未找到 $f，无法生成分享链接"
-      echo "    请重新运行安装脚本"
-      exit 1
-    fi
-
-    local host cert_mode
-    host="$(jq -r '.host' "$f")"
-    cert_mode="$(jq -r '.cert_mode' "$f")"
-
-    # VLESS+REALITY
-    local v_port v_uuid v_sni v_pbk v_sid
-    v_port="$(jq -r '.vless.port' "$f")"
-    v_uuid="$(jq -r '.vless.uuid' "$f")"
-    v_sni="$(jq -r '.vless.sni' "$f")"
-    v_pbk="$(jq -r '.vless.pbk' "$f")"
-    v_sid="$(jq -r '.vless.sid' "$f")"
-    local vless_link="vless://${v_uuid}@${host}:${v_port}?encryption=none&security=reality&sni=${v_sni}&fp=chrome&pbk=${v_pbk}&sid=${v_sid}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
-
-    # Hysteria2
-    local h_port h_auth h_obfs h_sni insecure
-    h_port="$(jq -r '.hy2.port' "$f")"
-    h_auth="$(jq -r '.hy2.auth' "$f")"
-    h_obfs="$(jq -r '.hy2.obfs_password' "$f")"
-    h_sni="$(jq -r '.hy2.sni // "www.bing.com"' "$f")"
-    [[ "$cert_mode" == "self" ]] && insecure=1 || insecure=0
-    local hy2_link="hysteria2://${h_auth}@${host}:${h_port}/?obfs=salamander&obfs-password=${h_obfs}&sni=${h_sni}&insecure=${insecure}&alpn=h3#HY2"
-
-    # TUIC
-    local t_port t_uuid t_pass t_sni
-    t_port="$(jq -r '.tuic.port // empty' "$f")"
-    t_uuid="$(jq -r '.tuic.uuid // empty' "$f")"
-    t_pass="$(jq -r '.tuic.password // empty' "$f")"
-    t_sni="$(jq -r '.tuic.sni // "www.bing.com"' "$f")"
-    local tuic_link=""
-    if [[ -n "$t_uuid" && "$t_uuid" != "null" ]]; then
-      tuic_link="tuic://${t_uuid}:${t_pass}@${host}:${t_port}?alpn=h3&udp_relay_mode=native&congestion_control=bbr&sni=${t_sni}&allow_insecure=${insecure}#TUIC-v5"
-    fi
-
-    echo ""
-    echo "==================== 分享链接 ===================="
-    echo ""
-    echo "[VLESS+REALITY]"
-    echo "$vless_link"
-    echo ""
-    echo "[Hysteria2]"
-    echo "$hy2_link"
-    if [[ -n "$tuic_link" ]]; then
-      echo ""
-      echo "[TUIC v5]"
-      echo "$tuic_link"
-    fi
-    echo ""
-    echo "=================================================="
+    show_links
     ;;
   ok-list)
     # 运行 country-test-all 并只输出 OK 列表（给菜单用）

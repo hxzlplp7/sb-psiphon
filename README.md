@@ -109,6 +109,12 @@ psictl country-test-all
 # 重启所有服务
 psictl restart
 
+# 查看分享链接（用于客户端导入）
+psictl links
+
+# 智能切换出口（先测试后选择可用国家）
+psictl smart-country
+
 # 查看日志
 psictl logs          # 全部
 psictl logs psi      # psiphon
@@ -206,6 +212,46 @@ psictl country SG    # 切换到新加坡
 psictl country AUTO  # 自动选择
 ```
 
+### Q: 证书模式选择？
+
+> **⚠️ 重要提示**：选择 `le`（Let's Encrypt）模式时，`HOST` 必须填写域名且已解析到本机 IP，不能填 IP 地址。
+
+A:
+- `self`（默认）：自签证书，适用于任何 VPS，客户端需启用 `insecure=true`
+- `le`：Let's Encrypt 自动证书，需要域名且 80/443 端口可用
+
+## 快速排障
+
+当服务不正常时，按以下步骤排查：
+
+### 1. 检查服务状态
+```bash
+systemctl status psiphon xray hysteria2 tuic
+```
+
+### 2. 查看详细日志
+```bash
+# 查看 Psiphon 日志（最常见问题来源）
+journalctl -u psiphon -n 200 --no-pager
+
+# 查看所有服务日志
+psictl logs
+```
+
+### 3. 检查端口监听
+```bash
+ss -lntup | grep -E '443|8443|2053|1081|8081'
+```
+
+### 4. 常见问题及解决
+
+| 问题 | 可能原因 | 解决方案 |
+|------|----------|----------|
+| `egress-test` 失败 | Psiphon 未连接成功 | 等待 30s 后重试，或 `psictl country AUTO` |
+| 端口已被占用 | 其他服务占用端口 | `ss -lntup \| grep <端口>` 查看并停止冲突服务 |
+| REALITY 连接失败 | SNI 被阻断 | 尝试更换 `REALITY_SNI`（如 `www.microsoft.com`） |
+| Hysteria2/TUIC 无法连接 | UDP 被阻断 | 检查防火墙是否放行 UDP 端口 |
+
 ## 卸载
 
 **使用 curl：**
@@ -217,6 +263,13 @@ bash <(curl -fsSL https://raw.githubusercontent.com/hxzlplp7/sb-psiphon/main/uni
 ```bash
 bash <(wget -qO- https://raw.githubusercontent.com/hxzlplp7/sb-psiphon/main/uninstall.sh)
 ```
+
+## 安全提示
+
+> **⚠️ 注意**：本脚本会从 GitHub 下载第三方二进制文件（Xray、Hysteria2、TUIC）。建议在受控环境中使用。
+
+- Psiphon 二进制优先使用 [hxzlplp7/psiphon-tunnel-core](https://github.com/hxzlplp7/psiphon-tunnel-core/releases) 的预编译版本（带 SHA256 校验）
+- 其他组件从官方 GitHub releases 下载
 
 ## 参考文档
 

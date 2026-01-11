@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# sb-psiphon 管理菜单
+# 提供交互式菜单界面调用 proxyctl 命令
+
+need_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    echo "请用 root 运行：sudo sbmenu"
+    exit 1
+  fi
+}
+
+menu() {
+  while true; do
+    clear
+    echo "╔══════════════════════════════════════════════════════╗"
+    echo "║        sb-psiphon 管理菜单 (Psiphon 出站)            ║"
+    echo "╠══════════════════════════════════════════════════════╣"
+    echo "║  1) 查看服务状态        (proxyctl status)            ║"
+    echo "║  2) 查看当前出口 IP     (proxyctl egress-test)       ║"
+    echo "║  3) 切换出口国家        (proxyctl country <CC>)      ║"
+    echo "║  4) 批量测试国家可用性  (proxyctl country-test ...)  ║"
+    echo "║  5) 重启所有服务        (proxyctl restart)           ║"
+    echo "║  6) 查看服务日志                                     ║"
+    echo "║  7) 重新安装            (bash install.sh)            ║"
+    echo "║  8) 卸载                (bash uninstall.sh)          ║"
+    echo "║  0) 退出                                             ║"
+    echo "╚══════════════════════════════════════════════════════╝"
+    echo ""
+    read -r -p "请选择 [0-8]: " choice || true
+
+    case "${choice:-}" in
+      1)
+        echo ""
+        proxyctl status
+        echo ""
+        read -r -p "按回车继续..." _
+        ;;
+      2)
+        echo ""
+        proxyctl egress-test
+        echo ""
+        read -r -p "按回车继续..." _
+        ;;
+      3)
+        echo ""
+        echo "常用国家代码: US(美国) JP(日本) SG(新加坡) DE(德国) FR(法国) GB(英国) NL(荷兰)"
+        read -r -p "输入国家代码: " cc
+        if [[ -n "$cc" ]]; then
+          proxyctl country "${cc}"
+        else
+          echo "未输入国家代码"
+        fi
+        echo ""
+        read -r -p "按回车继续..." _
+        ;;
+      4)
+        echo ""
+        echo "示例: US JP SG DE FR GB NL"
+        read -r -p "输入国家代码列表(空格分隔): " list
+        if [[ -n "$list" ]]; then
+          # shellcheck disable=SC2086
+          proxyctl country-test ${list}
+        else
+          echo "未输入国家代码"
+        fi
+        echo ""
+        read -r -p "按回车继续..." _
+        ;;
+      5)
+        echo ""
+        proxyctl restart
+        echo ""
+        read -r -p "按回车继续..." _
+        ;;
+      6)
+        echo ""
+        echo "1) sing-box 日志"
+        echo "2) warp-plus 日志"
+        echo "3) 全部日志"
+        read -r -p "选择 [1-3]: " t
+        case "${t:-}" in
+          1) journalctl -u sing-box -e --no-pager -n 50 ;;
+          2) journalctl -u warp-plus -e --no-pager -n 50 ;;
+          *) journalctl -u sing-box -u warp-plus -e --no-pager -n 50 ;;
+        esac
+        echo ""
+        read -r -p "按回车继续..." _
+        ;;
+      7)
+        echo ""
+        echo "将重新运行安装脚本..."
+        read -r -p "确认? [y/N]: " confirm
+        if [[ "${confirm:-}" =~ ^[Yy]$ ]]; then
+          if [[ -f /root/sb-psiphon/install.sh ]]; then
+            bash /root/sb-psiphon/install.sh
+          else
+            bash <(curl -fsSL https://raw.githubusercontent.com/hxzlplp7/sb-psiphon/main/install.sh)
+          fi
+        fi
+        read -r -p "按回车继续..." _
+        ;;
+      8)
+        echo ""
+        echo "将卸载 sb-psiphon..."
+        read -r -p "确认卸载? [y/N]: " confirm
+        if [[ "${confirm:-}" =~ ^[Yy]$ ]]; then
+          if [[ -f /root/sb-psiphon/uninstall.sh ]]; then
+            bash /root/sb-psiphon/uninstall.sh
+          else
+            bash <(curl -fsSL https://raw.githubusercontent.com/hxzlplp7/sb-psiphon/main/uninstall.sh)
+          fi
+          exit 0
+        fi
+        read -r -p "按回车继续..." _
+        ;;
+      0)
+        echo "再见！"
+        exit 0
+        ;;
+      *)
+        echo "无效选择，请输入 0-8"
+        sleep 1
+        ;;
+    esac
+  done
+}
+
+need_root
+menu

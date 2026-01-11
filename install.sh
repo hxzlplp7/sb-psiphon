@@ -641,4 +641,80 @@ ok "proxyctl 已安装到 /usr/local/bin/proxyctl"
 print_client_info "$HOST" "$VLESS_PORT" "$HY2_PORT" "$TUIC_PORT" "$REALITY_SERVER" \
   "$vless_uuid" "$tuic_uuid" "$tuic_pass" "$hy2_pass" "$hy2_obfs" "$reality_public" "$short_id" "$TLS_MODE"
 
-ok "完成"
+# install sbmenu (interactive menu)
+info "安装 sbmenu 管理菜单..."
+cat > /usr/local/bin/sbmenu <<'SBMENU_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+need_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    echo "请用 root 运行：sudo sbmenu"
+    exit 1
+  fi
+}
+
+menu() {
+  while true; do
+    clear
+    echo "╔══════════════════════════════════════════════════════╗"
+    echo "║        sb-psiphon 管理菜单 (Psiphon 出站)            ║"
+    echo "╠══════════════════════════════════════════════════════╣"
+    echo "║  1) 查看服务状态        (proxyctl status)            ║"
+    echo "║  2) 查看当前出口 IP     (proxyctl egress-test)       ║"
+    echo "║  3) 切换出口国家        (proxyctl country <CC>)      ║"
+    echo "║  4) 批量测试国家可用性  (proxyctl country-test ...)  ║"
+    echo "║  5) 重启所有服务        (proxyctl restart)           ║"
+    echo "║  6) 查看服务日志                                     ║"
+    echo "║  0) 退出                                             ║"
+    echo "╚══════════════════════════════════════════════════════╝"
+    echo ""
+    read -r -p "请选择 [0-6]: " choice || true
+
+    case "${choice:-}" in
+      1) echo ""; proxyctl status; echo ""; read -r -p "按回车继续..." _ ;;
+      2) echo ""; proxyctl egress-test; echo ""; read -r -p "按回车继续..." _ ;;
+      3)
+        echo ""
+        echo "常用国家: US(美国) JP(日本) SG(新加坡) DE(德国) FR(法国) GB(英国) NL(荷兰)"
+        read -r -p "输入国家代码: " cc
+        [[ -n "$cc" ]] && proxyctl country "${cc}" || echo "未输入"
+        echo ""; read -r -p "按回车继续..." _
+        ;;
+      4)
+        echo ""; echo "示例: US JP SG DE FR GB NL"
+        read -r -p "输入国家代码列表(空格分隔): " list
+        # shellcheck disable=SC2086
+        [[ -n "$list" ]] && proxyctl country-test ${list} || echo "未输入"
+        echo ""; read -r -p "按回车继续..." _
+        ;;
+      5) echo ""; proxyctl restart; echo ""; read -r -p "按回车继续..." _ ;;
+      6)
+        echo ""; echo "1) sing-box  2) warp-plus  3) 全部"
+        read -r -p "选择: " t
+        case "${t:-}" in
+          1) journalctl -u sing-box -e --no-pager -n 50 ;;
+          2) journalctl -u warp-plus -e --no-pager -n 50 ;;
+          *) journalctl -u sing-box -u warp-plus -e --no-pager -n 50 ;;
+        esac
+        echo ""; read -r -p "按回车继续..." _
+        ;;
+      0) echo "再见！"; exit 0 ;;
+      *) echo "无效选择"; sleep 1 ;;
+    esac
+  done
+}
+
+need_root
+menu
+SBMENU_EOF
+chmod +x /usr/local/bin/sbmenu
+ok "sbmenu 管理菜单已安装"
+
+ok "安装完成！"
+echo ""
+echo "=========================================="
+echo "  管理命令："
+echo "    sbmenu          # 交互式菜单"
+echo "    proxyctl status # 命令行管理"
+echo "=========================================="

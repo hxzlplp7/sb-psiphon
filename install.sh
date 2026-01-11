@@ -639,6 +639,62 @@ case "${1:-}" in
     echo ""
     echo "=================================================="
     ;;
+  ok-list)
+    # 运行 country-test-all 并只输出 OK 列表（给菜单用）
+    out="$(psictl country-test-all 2>&1)"
+    echo "$out" | grep -E '^OK:' | tail -n1 | sed 's/^OK:[[:space:]]*//'
+    ;;
+  smart-country)
+    echo ""
+    echo "[智能切换] 正在测试所有常用国家..."
+    echo ""
+    tmp="$(mktemp)"
+    psictl country-test-all | tee "$tmp"
+    ok_line="$(grep -E '^OK:' "$tmp" | tail -n1 | sed 's/^OK:[[:space:]]*//')"
+    rm -f "$tmp"
+
+    if [[ -z "${ok_line}" || "${ok_line}" == "none" ]]; then
+      echo ""
+      echo "[!] 没有检测到可用国家"
+      exit 1
+    fi
+
+    read -r -a ok_arr <<<"$ok_line"
+    echo ""
+    echo "========== 可用国家（按编号选择）=========="
+    i=1
+    for cc in "${ok_arr[@]}"; do
+      printf "  %2d) %s\n" "$i" "$cc"
+      i=$((i+1))
+    done
+    echo "   0) 取消"
+    echo "   A) AUTO（自动选择最佳出口）"
+    echo "=========================================="
+    read -r -p "请选择编号或国家码: " sel
+
+    if [[ "${sel^^}" == "A" || "${sel^^}" == "AUTO" ]]; then
+      psictl country AUTO
+      psictl egress-test || true
+      exit 0
+    fi
+
+    if [[ "$sel" =~ ^[0-9]+$ ]]; then
+      if [[ "$sel" -eq 0 ]]; then
+        exit 0
+      fi
+      idx=$((sel-1))
+      if [[ $idx -ge 0 && $idx -lt ${#ok_arr[@]} ]]; then
+        cc="${ok_arr[$idx]}"
+        psictl country "$cc"
+        psictl egress-test || true
+      else
+        echo "[!] 编号超出范围"
+      fi
+    else
+      psictl country "${sel^^}"
+      psictl egress-test || true
+    fi
+    ;;
   *)
     echo "psictl - Psiphon + 多协议入站 管理工具"
     echo ""
@@ -648,6 +704,7 @@ case "${1:-}" in
     echo "  psictl egress-test          测试当前出口 IP"
     echo "  psictl country-test <CC...> 批量测试国家"
     echo "  psictl country-test-all     测试所有常用国家"
+    echo "  psictl smart-country        智能切换(先测试后选择)"
     echo "  psictl links                查看分享链接"
     echo "  psictl restart              重启所有服务"
     echo "  psictl logs [psi|xray|hy2|tuic]"
@@ -673,9 +730,9 @@ while true; do
 ╠══════════════════════════════════════════════════════╣
 ║  1) 查看 Psiphon 状态     (psictl status)            ║
 ║  2) 查看当前出口 IP       (psictl egress-test)       ║
-║  3) 切换出口国家          (psictl country <CC>)      ║
-║  4) 批量测试国家可用性    (psictl country-test ...)  ║
-║  5) 测试所有常用国家      (psictl country-test-all)  ║
+║  3) 智能切换出口国家      (先测试后选择)               ║
+║  4) 手动切换出口国家      (psictl country <CC>)      ║
+║  5) 批量测试国家可用性    (psictl country-test ...)  ║
 ║  6) 查看分享链接          (psictl links)             ║
 ║  7) 重启所有服务          (psictl restart)           ║
 ║  8) 查看日志              (psictl logs ...)          ║
@@ -686,19 +743,24 @@ MENU
   case "$c" in
     1) psictl status; read -r -p "回车继续..." _ ;;
     2) psictl egress-test; read -r -p "回车继续..." _ ;;
-    3)
+    3) psictl smart-country; read -r -p "回车继续..." _ ;;
+    4)
       echo "常用: US JP SG DE FR GB NL AT BE CA CH"
       read -r -p "国家代码(AUTO=自动): " cc
       [[ -n "$cc" ]] && psictl country "$cc"
+      psictl egress-test || true
       read -r -p "回车继续..." _
       ;;
-    4)
-      read -r -p "输入国家列表(空格分隔，如 US JP SG): " line
-      # shellcheck disable=SC2086
-      [[ -n "$line" ]] && psictl country-test $line
+    5)
+      read -r -p "输入国家列表(空格分隔，如 US JP SG)或回车测全部: " line
+      if [[ -n "$line" ]]; then
+        # shellcheck disable=SC2086
+        psictl country-test $line
+      else
+        psictl country-test-all
+      fi
       read -r -p "回车继续..." _
       ;;
-    5) psictl country-test-all; read -r -p "回车继续..." _ ;;
     6) psictl links; read -r -p "回车继续..." _ ;;
     7) psictl restart; read -r -p "回车继续..." _ ;;
     8)

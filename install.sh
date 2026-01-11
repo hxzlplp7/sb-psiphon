@@ -15,7 +15,7 @@ WARPPLUS_DIR="/etc/warp-plus"
 WARPPLUS_ENV="${WARPPLUS_DIR}/warp-plus.env"
 WARPPLUS_SERVICE="/etc/systemd/system/warp-plus.service"
 
-color() { local c="$1"; shift; printf "\033[%sm%s\033[0m\n" "$c" "$*"; }
+color() { local c="$1"; shift; printf "\033[%sm%s\033[0m\n" "$c" "$*" >&2; }
 info() { color "36" "[*] $*"; }
 ok()   { color "32" "[+] $*"; }
 warn() { color "33" "[!] $*"; }
@@ -188,7 +188,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/warp-plus/warp-plus.env
-ExecStart=/usr/local/bin/warp-plus ${EXTRA_FLAGS} --country ${COUNTRY} -b ${SOCKS_BIND}
+ExecStart=/usr/local/bin/warp-plus -4 ${EXTRA_FLAGS} --country ${COUNTRY} -b ${SOCKS_BIND}
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -203,19 +203,23 @@ EOF
 }
 
 gen_keys() {
-  info "生成 VLESS/TUIC UUID、HY2 密码、REALITY 密钥与 short_id..."
-  local vless_uuid tuic_uuid tuic_pass hy2_pass hy2_obfs reality_json private_key public_key short_id
+  # 注意：不要在这里调用 info()，因为 stdout 会被捕获
+  local vless_uuid tuic_uuid tuic_pass hy2_pass hy2_obfs reality_out private_key public_key short_id
 
-  vless_uuid="$(sing-box generate uuid)"
-  tuic_uuid="$(sing-box generate uuid)"
+  # UUID：优先用 sing-box，fallback 到 /proc/sys/kernel/random/uuid
+  vless_uuid="$(sing-box generate uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)"
+  tuic_uuid="$(sing-box generate uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)"
   tuic_pass="$(openssl rand -base64 18 | tr -d '=+/ ' | head -c 16)"
   hy2_pass="$(openssl rand -base64 24 | tr -d '=+/ ' | head -c 20)"
   hy2_obfs="$(openssl rand -base64 24 | tr -d '=+/ ' | head -c 20)"
 
-  reality_json="$(sing-box generate reality-keypair)"
-  private_key="$(echo "$reality_json" | jq -r '.private_key')"
-  public_key="$(echo "$reality_json" | jq -r '.public_key')"
-  short_id="$(sing-box generate rand 8 --hex)"
+  # reality-keypair 输出格式是文本 "PrivateKey: xxx\nPublicKey: xxx"，不是 JSON
+  reality_out="$(sing-box generate reality-keypair 2>/dev/null)"
+  private_key="$(echo "$reality_out" | awk -F': *' '/PrivateKey/{print $2}')"
+  public_key="$(echo "$reality_out" | awk -F': *' '/PublicKey/{print $2}')"
+  
+  # short_id：优先用 sing-box，fallback 到 openssl
+  short_id="$(sing-box generate rand --hex 8 2>/dev/null || openssl rand -hex 8)"
 
   echo "${vless_uuid}|${tuic_uuid}|${tuic_pass}|${hy2_pass}|${hy2_obfs}|${private_key}|${public_key}|${short_id}"
 }
@@ -443,6 +447,7 @@ CERT_PATH="${cert_pair%|*}"
 KEY_PATH="${cert_pair#*|}"
 
 # keys
+info "生成 VLESS/TUIC UUID、HY2 密码、REALITY 密钥与 short_id..."
 keys="$(gen_keys)"
 vless_uuid="$(echo "$keys" | cut -d'|' -f1)"
 tuic_uuid="$(echo "$keys" | cut -d'|' -f2)"

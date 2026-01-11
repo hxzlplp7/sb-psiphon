@@ -27,6 +27,7 @@ rm -rf /etc/sing-box
 info "删除可执行文件..."
 rm -f /usr/local/bin/warp-plus
 rm -f /usr/local/bin/proxyctl
+rm -f /usr/local/bin/sbmenu
 
 info "清理自签证书..."
 rm -rf /etc/ssl/sbox

@@ -8,8 +8,9 @@ DEFAULT_HY2_PORT="8443"
 DEFAULT_TUIC_PORT="2053"
 DEFAULT_REALITY_SNI="www.apple.com"
 DEFAULT_CERT_MODE="self"   # self | le
-DEFAULT_PSIPHON_COUNTRY="US"
+DEFAULT_PSIPHON_REGION="US"
 DEFAULT_PSIPHON_SOCKS="1081"
+DEFAULT_PSIPHON_HTTP="8081"
 
 # ========= 工具函数 =========
 red(){ echo -e "\033[31m$*\033[0m" >&2; }
@@ -23,37 +24,42 @@ need_root(){
   fi
 }
 
-# 确保 curl 可用（脚本后续需要 curl）
-ensure_curl(){
+# 确保 curl/wget 可用
+ensure_downloader(){
   if command -v curl >/dev/null 2>&1; then
     return 0
   fi
-  ylw "[*] 检测到 curl 未安装，正在安装..."
+  if command -v wget >/dev/null 2>&1; then
+    return 0
+  fi
+  ylw "[*] 检测到 curl/wget 未安装，正在安装..."
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update -y >/dev/null 2>&1 || true
-    apt-get install -y curl >/dev/null 2>&1
+    apt-get install -y curl wget >/dev/null 2>&1
   elif command -v dnf >/dev/null 2>&1; then
-    dnf -y install curl >/dev/null 2>&1
+    dnf -y install curl wget >/dev/null 2>&1
   elif command -v yum >/dev/null 2>&1; then
-    yum -y install curl >/dev/null 2>&1
+    yum -y install curl wget >/dev/null 2>&1
   else
-    red "无法自动安装 curl，请手动安装后重试"
+    red "无法自动安装 curl/wget，请手动安装后重试"
     exit 1
   fi
-  grn "[+] curl 已安装"
+  grn "[+] curl/wget 已安装"
 }
 
-# 入口点先确保 curl 可用
+# 入口点
 need_root
-ensure_curl
+ensure_downloader
 
 detect_arch(){
-  local a
-  a="$(uname -m)"
-  case "$a" in
-    x86_64|amd64) echo "amd64" ;;
+  local m
+  m="$(uname -m)"
+  case "$m" in
+    x86_64|amd64) echo "x86_64" ;;
+    i386|i686)    echo "i686" ;;
     aarch64|arm64) echo "arm64" ;;
-    *) red "不支持的架构: $a"; exit 1 ;;
+    armv7l|armv6l) echo "arm" ;;
+    *) echo "unknown" ;;
   esac
 }
 
@@ -71,9 +77,9 @@ install_deps(){
   ylw "[*] 安装依赖..."
   if [[ "$pm" == "apt" ]]; then
     apt-get update -y
-    apt-get install -y curl jq unzip openssl ca-certificates socat cron
+    apt-get install -y curl wget jq unzip openssl ca-certificates socat cron
   else
-    "$pm" -y install curl jq unzip openssl ca-certificates socat cronie || true
+    "$pm" -y install curl wget jq unzip openssl ca-certificates socat cronie || true
     systemctl enable --now crond >/dev/null 2>&1 || true
   fi
   grn "[+] 依赖安装完成"
@@ -94,11 +100,24 @@ rand_hex(){
   openssl rand -hex "$1"
 }
 
+download_file(){
+  local url="$1" dest="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$dest"
+  else
+    wget -qO "$dest" "$url"
+  fi
+}
+
 download_latest_github_release_asset(){
   local repo="$1" regex="$2"
   local api="https://api.github.com/repos/${repo}/releases/latest"
   local url
-  url="$(curl -fsSL "$api" | jq -r ".assets[].browser_download_url" | grep -E "$regex" | head -n1 || true)"
+  if command -v curl >/dev/null 2>&1; then
+    url="$(curl -fsSL "$api" | jq -r ".assets[].browser_download_url" | grep -E "$regex" | head -n1 || true)"
+  else
+    url="$(wget -qO- "$api" | jq -r ".assets[].browser_download_url" | grep -E "$regex" | head -n1 || true)"
+  fi
   if [[ -z "$url" ]]; then
     red "找不到 ${repo} 的 release 资源：$regex"
     exit 1
@@ -106,56 +125,65 @@ download_latest_github_release_asset(){
   echo "$url"
 }
 
-# ========= warp-plus (Psiphon SOCKS5) =========
-install_warp_plus(){
-  local arch="$1"
+# ========= Psiphon ConsoleClient (官方二进制) =========
+install_psiphon(){
+  local arch
+  arch="$(detect_arch)"
 
-  ylw "[*] 安装 warp-plus..."
-  local api="https://api.github.com/repos/bepass-org/warp-plus/releases/latest"
-  local asset="warp-plus_linux-${arch}.zip"
-  local url
-  url="$(curl -fsSL "$api" | jq -r --arg A "$asset" '.assets[] | select(.name==$A) | .browser_download_url' | head -n1)"
-  
-  if [[ -z "$url" || "$url" == "null" ]]; then
-    red "获取 warp-plus 下载链接失败（架构: ${arch}）"
-    exit 1
+  ylw "[*] 安装 Psiphon ConsoleClient..."
+  mkdir -p /etc/psiphon /var/lib/psiphon
+
+  if [[ "$arch" == "x86_64" || "$arch" == "i686" ]]; then
+    # 官方二进制：psiphon-tunnel-core-binaries 仓库只有 x86_64 和 i686
+    local url="https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core-binaries/master/linux/psiphon-tunnel-core-${arch}"
+    ylw "[*] 下载 Psiphon 二进制: $url"
+    download_file "$url" /usr/local/bin/psiphon-tunnel-core
+    chmod +x /usr/local/bin/psiphon-tunnel-core
+  else
+    # ARM 架构：需要 Go 编译
+    ylw "[!] 架构=$arch：官方无预编译二进制，使用 Go 编译..."
+    local pm
+    pm="$(detect_pm)"
+    if [[ "$pm" == "apt" ]]; then
+      apt-get install -y git golang build-essential
+    else
+      "$pm" -y install git golang gcc make || true
+    fi
+
+    rm -rf /tmp/psiphon-tunnel-core
+    git clone --depth 1 https://github.com/Psiphon-Labs/psiphon-tunnel-core.git /tmp/psiphon-tunnel-core
+    cd /tmp/psiphon-tunnel-core/ConsoleClient
+    go build -o /usr/local/bin/psiphon-tunnel-core .
+    chmod +x /usr/local/bin/psiphon-tunnel-core
+    cd /
   fi
 
-  rm -rf /tmp/warp-plus && mkdir -p /tmp/warp-plus
-  curl -fsSL "$url" -o /tmp/warp-plus/pkg.zip
-  unzip -q /tmp/warp-plus/pkg.zip -d /tmp/warp-plus || true
-
-  local bin
-  bin="$(find /tmp/warp-plus -type f -name "warp-plus" | head -n1 || true)"
-  if [[ -z "$bin" ]]; then
-    bin="$(find /tmp/warp-plus -type f -perm -111 | head -n1 || true)"
-  fi
-  if [[ -z "$bin" ]]; then
-    red "warp-plus 包结构未知，未找到可执行文件"
-    exit 1
-  fi
-
-  install -m 0755 "$bin" /usr/local/bin/warp-plus
-  grn "[+] warp-plus 安装完成"
-
-  mkdir -p /etc/warp-plus
-  cat > /etc/warp-plus/config.json <<EOF
+  # 写配置文件
+  cat >/etc/psiphon/psiphon.config <<EOF
 {
-  "bind": "127.0.0.1:${PSIPHON_SOCKS}",
-  "cfon": true,
-  "country": "${PSIPHON_COUNTRY}"
+  "LocalHttpProxyPort": ${PSIPHON_HTTP},
+  "LocalSocksProxyPort": ${PSIPHON_SOCKS},
+  "EgressRegion": "${PSIPHON_REGION}",
+  "PropagationChannelId": "FFFFFFFFFFFFFFFF",
+  "SponsorId": "FFFFFFFFFFFFFFFF",
+  "RemoteServerListDownloadFilename": "/var/lib/psiphon/remote_server_list",
+  "RemoteServerListSignaturePublicKey": "MIICIDANBgkqhkiG9w0BAQEFAAOCAg0AMIICCAKCAgEAt7Ls+/39r+T6zNW7GiVpJfzq/xvL9SBH5rIFnk0RXYEYavax3WS6HOD35eTAqn8AniOwiH+DOkvgSKF2caqk/y1dfq47Pdymtwzp9ikpB1C5OfAysXzBiwVJlCdajBKvBZDerV1cMvRzCKvKwRmvDmHgphQQ7WfXIGbRbmmk6opMBh3roE42KcotLFtqp0RRwLtcBRNtCdsrVsjiI1Lqz/lH+T61sGjSjQ3CHMuZYSQJZo/KrvzgQXpkaCTdbObxHqb6/+i1qaVOfEsvjoiyzTxJADvSytVtcTjijhPEV6XskJVHE1Zgl+7rATr/pDQkw6DPCNBS1+Y6fy7GstZALQXwEDN/qhQI9kWkHijT8ns+i1vGg00Mk/6J75arLhqcodWsdeG/M/moWgqQAnlZAGVtJI1OgeF5fsPpXu4kctOfuZlGjVZXQNW34aOzm8r8S0eVZitPlbhcPiR4gT/aSMz/wd8lZlzZYsje/Jr8u/YtlwjjreZrGRmG8KMOzukV3lLmMppXFMvl4bxv6YFEmIuTsOhbLTwFgh7KYNjodLj/LsqRVfwz31PgWQFTEPICV7GCvgVlPRxnofqKSjgTWI4mxDhBpVcATvaoBl1L/6WLbFvBsoAUBItWwctO2xalKxF5szhGm8lccoc5MZr8kfE0uxMgsxz4er68iCID+rsCAQM=",
+  "RemoteServerListUrl": "https://s3.amazonaws.com//psiphon/web/mjr4-p23r-puwl/server_list_compressed",
+  "UseIndistinguishableTLS": true
 }
 EOF
 
-  cat > /etc/systemd/system/warp-plus.service <<'EOF'
+  # systemd 服务
+  cat >/etc/systemd/system/psiphon.service <<'EOF'
 [Unit]
-Description=warp-plus (WARP + Psiphon) local SOCKS5
+Description=Psiphon Tunnel Core (ConsoleClient)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/warp-plus -4 -c /etc/warp-plus/config.json
+WorkingDirectory=/var/lib/psiphon
+ExecStart=/usr/local/bin/psiphon-tunnel-core -config /etc/psiphon/psiphon.config
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -165,24 +193,27 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now warp-plus
-  grn "[+] warp-plus 已启动（SOCKS5: 127.0.0.1:${PSIPHON_SOCKS}, 国家: ${PSIPHON_COUNTRY}）"
+  systemctl enable --now psiphon
+  grn "[+] Psiphon 已启动（SOCKS: 127.0.0.1:${PSIPHON_SOCKS}, HTTP: 127.0.0.1:${PSIPHON_HTTP}, 国家: ${PSIPHON_REGION}）"
 }
 
 # ========= Xray (VLESS + REALITY) =========
 install_xray_vless_reality(){
-  local arch="$1"
+  local arch
+  arch="$(detect_arch)"
 
   ylw "[*] 安装 Xray-core（VLESS+REALITY）..."
   local url
-  if [[ "$arch" == "amd64" ]]; then
+  if [[ "$arch" == "x86_64" ]]; then
     url="$(download_latest_github_release_asset "XTLS/Xray-core" "Xray-linux-64.zip")"
-  else
+  elif [[ "$arch" == "arm64" ]]; then
     url="$(download_latest_github_release_asset "XTLS/Xray-core" "Xray-linux-arm64-v8a.zip")"
+  else
+    url="$(download_latest_github_release_asset "XTLS/Xray-core" "Xray-linux-32.zip")"
   fi
 
   rm -rf /tmp/xray && mkdir -p /tmp/xray
-  curl -fsSL "$url" -o /tmp/xray/xray.zip
+  download_file "$url" /tmp/xray/xray.zip
   unzip -q /tmp/xray/xray.zip -d /tmp/xray
 
   install -m 0755 /tmp/xray/xray /usr/local/bin/xray
@@ -248,8 +279,8 @@ EOF
   cat > /etc/systemd/system/xray.service <<'EOF'
 [Unit]
 Description=Xray-core (VLESS+REALITY) Server
-After=network-online.target warp-plus.service
-Wants=network-online.target warp-plus.service
+After=network-online.target psiphon.service
+Wants=network-online.target psiphon.service
 
 [Service]
 Type=simple
@@ -273,27 +304,29 @@ EOF
 
 # ========= Hysteria2 =========
 install_hysteria2(){
-  local arch="$1"
+  local arch
+  arch="$(detect_arch)"
 
   ylw "[*] 安装 Hysteria2..."
   local url
-  if [[ "$arch" == "amd64" ]]; then
+  if [[ "$arch" == "x86_64" ]]; then
     url="$(download_latest_github_release_asset "apernet/hysteria" "hysteria-linux-amd64$")"
-  else
+  elif [[ "$arch" == "arm64" ]]; then
     url="$(download_latest_github_release_asset "apernet/hysteria" "hysteria-linux-arm64$")"
+  else
+    url="$(download_latest_github_release_asset "apernet/hysteria" "hysteria-linux-386$")"
   fi
 
-  curl -fsSL "$url" -o /usr/local/bin/hysteria
+  download_file "$url" /usr/local/bin/hysteria
   chmod +x /usr/local/bin/hysteria
 
   local hy_pass obfs_pass
   hy_pass="$(rand_hex 12)"
   obfs_pass="$(rand_hex 12)"
 
-  mkdir -p /etc/hysteria
-  mkdir -p /etc/ssl/sbox
+  mkdir -p /etc/hysteria /etc/ssl/sbox
 
-  # 生成自签证书（如果不存在）
+  # 生成自签证书
   if [[ ! -f /etc/ssl/sbox/self.key ]]; then
     openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
       -keyout /etc/ssl/sbox/self.key -out /etc/ssl/sbox/self.crt \
@@ -344,8 +377,8 @@ EOF
   cat > /etc/systemd/system/hysteria2.service <<'EOF'
 [Unit]
 Description=Hysteria2 Server
-After=network-online.target warp-plus.service
-Wants=network-online.target warp-plus.service
+After=network-online.target psiphon.service
+Wants=network-online.target psiphon.service
 
 [Service]
 Type=simple
@@ -366,35 +399,39 @@ EOF
   HY2_OBFS="$obfs_pass"
 }
 
-# ========= TUIC (EAimTY/tuic 官方实现) =========
+# ========= TUIC =========
 install_tuic_server(){
-  local arch="$1"
+  local arch
+  arch="$(detect_arch)"
 
   ylw "[*] 安装 tuic-server..."
   local url
-  if [[ "$arch" == "amd64" ]]; then
+  if [[ "$arch" == "x86_64" ]]; then
     url="$(download_latest_github_release_asset "EAimTY/tuic" "tuic-server.*x86_64.*linux" || true)"
-  else
+  elif [[ "$arch" == "arm64" ]]; then
     url="$(download_latest_github_release_asset "EAimTY/tuic" "tuic-server.*aarch64.*linux" || true)"
   fi
 
   if [[ -z "$url" ]]; then
-    ylw "[!] 未能自动获取 tuic-server，尝试备用方式..."
-    # 尝试直接从 releases 列表获取
+    ylw "[!] 未能获取 tuic-server，尝试备用方式..."
     local api="https://api.github.com/repos/EAimTY/tuic/releases"
-    if [[ "$arch" == "amd64" ]]; then
-      url="$(curl -fsSL "$api" | jq -r '.[0].assets[].browser_download_url' | grep -i "tuic-server.*x86_64.*linux" | head -n1 || true)"
-    else
-      url="$(curl -fsSL "$api" | jq -r '.[0].assets[].browser_download_url' | grep -i "tuic-server.*aarch64.*linux" | head -n1 || true)"
+    if command -v curl >/dev/null 2>&1; then
+      if [[ "$arch" == "x86_64" ]]; then
+        url="$(curl -fsSL "$api" | jq -r '.[0].assets[].browser_download_url' | grep -i "tuic-server.*x86_64.*linux" | head -n1 || true)"
+      else
+        url="$(curl -fsSL "$api" | jq -r '.[0].assets[].browser_download_url' | grep -i "tuic-server.*aarch64.*linux" | head -n1 || true)"
+      fi
     fi
   fi
 
   if [[ -z "$url" ]]; then
-    red "未能获取 tuic-server 下载链接，请手动下载放到 /usr/local/bin/tuic-server"
-    exit 1
+    ylw "[!] 跳过 TUIC 安装（未找到可用二进制）"
+    TUIC_UUID=""
+    TUIC_PASS=""
+    return 0
   fi
 
-  curl -fsSL "$url" -o /usr/local/bin/tuic-server
+  download_file "$url" /usr/local/bin/tuic-server
   chmod +x /usr/local/bin/tuic-server
 
   local tuic_uuid tuic_pass
@@ -423,8 +460,8 @@ EOF
   cat > /etc/systemd/system/tuic.service <<'EOF'
 [Unit]
 Description=tuic-server
-After=network-online.target warp-plus.service
-Wants=network-online.target warp-plus.service
+After=network-online.target psiphon.service
+Wants=network-online.target psiphon.service
 
 [Service]
 Type=simple
@@ -445,111 +482,124 @@ EOF
   TUIC_PASS="$tuic_pass"
 }
 
-# ========= proxyctl =========
-install_proxyctl(){
-  ylw "[*] 安装 proxyctl..."
-  cat > /usr/local/bin/proxyctl <<'PROXYCTL_EOF'
+# ========= psictl (Psiphon 管理工具) =========
+install_psictl(){
+  ylw "[*] 安装 psictl..."
+  cat > /usr/local/bin/psictl <<'PSICTL_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-CFG="/etc/warp-plus/config.json"
-SOCKS_PORT="$(jq -r '.bind' "$CFG" 2>/dev/null | awk -F: '{print $2}' || echo "1081")"
-COUNTRY="$(jq -r '.country' "$CFG" 2>/dev/null || echo "US")"
+CFG="/etc/psiphon/psiphon.config"
+SOCKS_PORT="$(jq -r '.LocalSocksProxyPort' "$CFG" 2>/dev/null || echo "1081")"
+REGION="$(jq -r '.EgressRegion // ""' "$CFG" 2>/dev/null || echo "")"
 
-usage(){
-  cat <<USAGE
-proxyctl - 管理 warp-plus(Psiphon) 出站 + 出口测试
+# 常用可用国家码
+ALL=(AT BE BG CA CH CZ DE DK EE ES FI FR GB HU IE IN IT JP LV NL NO PL RO RS SE SG SK US)
 
-用法:
-  proxyctl status               查看服务状态
-  proxyctl country <CC>         切换出口国家
-  proxyctl egress-test          测试当前出口 IP
-  proxyctl country-test <CC...> 批量测试国家可用性
-  proxyctl restart              重启所有服务
-  proxyctl logs [wp|xray|hy2|tuic]
-USAGE
+set_region() {
+  local cc="$1"
+  local tmp
+  tmp="$(mktemp)"
+  if [[ "${cc^^}" == "AUTO" || -z "$cc" ]]; then
+    jq '.EgressRegion=""' "$CFG" >"$tmp"
+  else
+    jq --arg cc "${cc^^}" '.EgressRegion=$cc' "$CFG" >"$tmp"
+  fi
+  mv "$tmp" "$CFG"
+  systemctl restart psiphon
+  sleep 3
 }
 
-egress_test(){
-  curl -fsS --max-time 10 --socks5-hostname "127.0.0.1:${SOCKS_PORT}" https://ipinfo.io/json 2>/dev/null \
-    | jq -r '"IP: \(.ip)\nCountry: \(.country)\nOrg: \(.org)\nCity: \(.city)\nRegion: \(.region)"' || {
-      echo "[-] 出口测试失败（SOCKS 无响应）"
-      return 1
-    }
+egress_test() {
+  local json
+  json="$(curl -fsS --max-time 12 --socks5-hostname "127.0.0.1:${SOCKS_PORT}" https://ipinfo.io/json 2>/dev/null || true)"
+  if [[ -z "$json" ]]; then
+    echo "[-] FAIL: SOCKS 不通 (127.0.0.1:${SOCKS_PORT})"
+    return 1
+  fi
+  echo "$json" | jq -r '"IP: \(.ip)\nCountry: \(.country)\nOrg: \(.org)\nCity: \(.city)"'
 }
 
 case "${1:-}" in
   status)
-    echo "========== warp-plus =========="
-    echo "Country: ${COUNTRY}"
-    echo "SOCKS : 127.0.0.1:${SOCKS_PORT}"
-    systemctl --no-pager -l status warp-plus 2>/dev/null || echo "未运行"
-    echo
-    echo "========== xray =========="
-    systemctl --no-pager -l status xray 2>/dev/null || echo "未运行"
-    echo
-    echo "========== hysteria2 =========="
-    systemctl --no-pager -l status hysteria2 2>/dev/null || echo "未运行"
-    echo
-    echo "========== tuic =========="
-    systemctl --no-pager -l status tuic 2>/dev/null || echo "未运行"
+    echo "EgressRegion: ${REGION:-AUTO}"
+    echo "SOCKS: 127.0.0.1:${SOCKS_PORT}"
+    echo ""
+    systemctl --no-pager -l status psiphon 2>/dev/null || echo "未运行"
     ;;
   country)
-    cc="${2:-}"
-    if [[ -z "$cc" ]]; then usage; exit 1; fi
-    cc="${cc^^}"
-    tmp="$(mktemp)"
-    jq --arg cc "$cc" '.country=$cc' "$CFG" > "$tmp"
-    mv "$tmp" "$CFG"
-    systemctl restart warp-plus
-    echo "[+] 已切换国家为: $cc"
+    [[ -n "${2:-}" ]] || { echo "用法: psictl country <CC|AUTO>"; exit 1; }
+    set_region "$2"
+    echo "[+] 已切换国家为: ${2^^}"
     ;;
   egress-test)
     egress_test
     ;;
   country-test)
     shift || true
-    if [[ $# -lt 1 ]]; then usage; exit 1; fi
-    ok=()
-    fail=()
+    [[ $# -ge 1 ]] || { echo "用法: psictl country-test <CC...>"; exit 1; }
+    ok=(); fail=(); mismatch=()
     for cc in "$@"; do
-      cc="${cc^^}"
-      echo "==> 测试 $cc"
-      proxyctl country "$cc" >/dev/null 2>&1
-      sleep 3
-      if out="$(egress_test 2>/dev/null)"; then
-        echo "$out"
-        ok+=("$cc")
-      else
-        echo "[-] $cc 失败"
-        fail+=("$cc")
+      echo "==> ${cc^^}"
+      set_region "$cc" >/dev/null 2>&1
+      json="$(curl -fsS --max-time 12 --socks5-hostname "127.0.0.1:${SOCKS_PORT}" https://ipinfo.io/json 2>/dev/null || true)"
+      if [[ -z "$json" ]]; then
+        echo "  [-] FAIL (no response)"
+        fail+=("${cc^^}")
+        continue
       fi
-      echo
+      got="$(echo "$json" | jq -r '.country // empty' 2>/dev/null || true)"
+      if [[ -z "$got" ]]; then
+        echo "  [~] MISMATCH (no country field)"
+        mismatch+=("${cc^^}")
+        continue
+      fi
+      if [[ "${got^^}" == "${cc^^}" ]]; then
+        echo "  [+] OK (country=${got^^})"
+        ok+=("${cc^^}")
+      else
+        echo "  [~] MISMATCH (want=${cc^^} got=${got^^})"
+        mismatch+=("${cc^^}")
+      fi
     done
-    echo "========== 汇总 =========="
-    echo "成功: ${ok[*]:-无}"
-    echo "失败: ${fail[*]:-无}"
+    echo ""
+    echo "---- SUMMARY ----"
+    echo "OK: ${ok[*]:-none}"
+    echo "FAIL: ${fail[*]:-none}"
+    echo "MISMATCH: ${mismatch[*]:-none}"
+    ;;
+  country-test-all)
+    psictl country-test "${ALL[@]}"
     ;;
   restart)
-    systemctl restart warp-plus xray hysteria2 tuic 2>/dev/null || true
+    systemctl restart psiphon xray hysteria2 tuic 2>/dev/null || true
     echo "[+] 已重启所有服务"
     ;;
   logs)
     case "${2:-}" in
-      wp|warp) journalctl -u warp-plus -n 100 --no-pager ;;
+      psi|psiphon) journalctl -u psiphon -n 100 --no-pager ;;
       xray) journalctl -u xray -n 100 --no-pager ;;
       hy2|hysteria) journalctl -u hysteria2 -n 100 --no-pager ;;
       tuic) journalctl -u tuic -n 100 --no-pager ;;
-      *) journalctl -u warp-plus -u xray -u hysteria2 -u tuic -n 100 --no-pager ;;
+      *) journalctl -u psiphon -u xray -u hysteria2 -u tuic -n 100 --no-pager ;;
     esac
     ;;
   *)
-    usage
+    echo "psictl - Psiphon + 多协议入站 管理工具"
+    echo ""
+    echo "用法:"
+    echo "  psictl status               查看 Psiphon 状态"
+    echo "  psictl country <CC|AUTO>    切换出口国家"
+    echo "  psictl egress-test          测试当前出口 IP"
+    echo "  psictl country-test <CC...> 批量测试国家"
+    echo "  psictl country-test-all     测试所有常用国家"
+    echo "  psictl restart              重启所有服务"
+    echo "  psictl logs [psi|xray|hy2|tuic]"
     ;;
 esac
-PROXYCTL_EOF
-  chmod +x /usr/local/bin/proxyctl
-  grn "[+] proxyctl 已安装"
+PSICTL_EOF
+  chmod +x /usr/local/bin/psictl
+  grn "[+] psictl 已安装"
 }
 
 # ========= vpsmenu =========
@@ -563,39 +613,41 @@ while true; do
   clear
   cat <<MENU
 ╔══════════════════════════════════════════════════════╗
-║     多协议入站 + Psiphon 出站 管理菜单               ║
+║   多协议入站 + Psiphon 出站 管理菜单                 ║
 ╠══════════════════════════════════════════════════════╣
-║  1) 查看服务状态        (proxyctl status)            ║
-║  2) 查看当前出口 IP     (proxyctl egress-test)       ║
-║  3) 切换出口国家        (proxyctl country <CC>)      ║
-║  4) 批量测试国家可用性  (proxyctl country-test ...)  ║
-║  5) 重启所有服务        (proxyctl restart)           ║
-║  6) 查看日志            (proxyctl logs ...)          ║
+║  1) 查看 Psiphon 状态     (psictl status)            ║
+║  2) 查看当前出口 IP       (psictl egress-test)       ║
+║  3) 切换出口国家          (psictl country <CC>)      ║
+║  4) 批量测试国家可用性    (psictl country-test ...)  ║
+║  5) 测试所有常用国家      (psictl country-test-all)  ║
+║  6) 重启所有服务          (psictl restart)           ║
+║  7) 查看日志              (psictl logs ...)          ║
 ║  0) 退出                                             ║
 ╚══════════════════════════════════════════════════════╝
 MENU
-  read -r -p "请选择 [0-6]: " c || true
+  read -r -p "请选择 [0-7]: " c || true
   case "$c" in
-    1) proxyctl status; read -r -p "回车继续..." _ ;;
-    2) proxyctl egress-test; read -r -p "回车继续..." _ ;;
-    3) 
-      echo "常用: US JP SG DE FR GB NL HK TW KR"
-      read -r -p "国家代码: " cc
-      [[ -n "$cc" ]] && proxyctl country "$cc"
-      read -r -p "回车继续..." _ 
+    1) psictl status; read -r -p "回车继续..." _ ;;
+    2) psictl egress-test; read -r -p "回车继续..." _ ;;
+    3)
+      echo "常用: US JP SG DE FR GB NL AT BE CA CH"
+      read -r -p "国家代码(AUTO=自动): " cc
+      [[ -n "$cc" ]] && psictl country "$cc"
+      read -r -p "回车继续..." _
       ;;
-    4) 
+    4)
       read -r -p "输入国家列表(空格分隔，如 US JP SG): " line
       # shellcheck disable=SC2086
-      [[ -n "$line" ]] && proxyctl country-test $line
-      read -r -p "回车继续..." _ 
+      [[ -n "$line" ]] && psictl country-test $line
+      read -r -p "回车继续..." _
       ;;
-    5) proxyctl restart; read -r -p "回车继续..." _ ;;
-    6) 
-      echo "wp=warp-plus, xray, hy2=hysteria2, tuic"
+    5) psictl country-test-all; read -r -p "回车继续..." _ ;;
+    6) psictl restart; read -r -p "回车继续..." _ ;;
+    7)
+      echo "psi=psiphon, xray, hy2=hysteria2, tuic"
       read -r -p "选择(默认全部): " t
-      proxyctl logs "${t:-all}"
-      read -r -p "回车继续..." _ 
+      psictl logs "${t:-all}"
+      read -r -p "回车继续..." _
       ;;
     0) exit 0 ;;
   esac
@@ -632,6 +684,10 @@ print_client_info(){
   OBFS密码: ${HY2_OBFS}
   证书: ${CERT_MODE} (self 模式客户端需 skip-cert-verify / insecure=true)
 
+EOF
+
+  if [[ -n "${TUIC_UUID:-}" ]]; then
+    cat <<EOF
 [TUIC v5]
   地址: ${HOST}
   端口: ${TUIC_PORT} (UDP)
@@ -641,14 +697,19 @@ print_client_info(){
   ALPN: h3
   证书: self（客户端需 skip-cert-verify / insecure=true）
 
+EOF
+  fi
+
+  cat <<EOF
 ===============================================================
 
 管理命令：
-  vpsmenu             # 交互式菜单
-  proxyctl status     # 查看状态
-  proxyctl country US # 切换出口国家
-  proxyctl egress-test
-  proxyctl country-test US JP SG DE FR GB
+  vpsmenu                  # 交互式菜单
+  psictl status            # 查看 Psiphon 状态
+  psictl country US        # 切换出口国家
+  psictl egress-test       # 测试当前出口
+  psictl country-test US JP SG DE
+  psictl country-test-all  # 测试所有常用国家
 
 EOF
 }
@@ -665,17 +726,18 @@ main(){
   prompt TUIC_PORT "TUIC v5 端口(UDP)" "$DEFAULT_TUIC_PORT"
   prompt REALITY_SNI "REALITY 伪装站点(需TLS1.3/H2，示例 www.apple.com)" "$DEFAULT_REALITY_SNI"
   prompt CERT_MODE "HY2/TUIC TLS证书模式：le(自动申请) 或 self(自签)" "$DEFAULT_CERT_MODE"
-  prompt PSIPHON_COUNTRY "Psiphon 出站国家(两位代码，如 US/JP/SG/DE...)" "$DEFAULT_PSIPHON_COUNTRY"
+  prompt PSIPHON_REGION "Psiphon 出站国家(两位代码，如 US/JP/SG/DE，AUTO=自动)" "$DEFAULT_PSIPHON_REGION"
   prompt PSIPHON_SOCKS "Psiphon 本地 SOCKS5 端口" "$DEFAULT_PSIPHON_SOCKS"
+  prompt PSIPHON_HTTP "Psiphon 本地 HTTP 代理端口" "$DEFAULT_PSIPHON_HTTP"
 
   ylw "[*] 请确保放行端口：${VLESS_PORT}/tcp, ${HY2_PORT}/udp, ${TUIC_PORT}/udp"
 
-  install_warp_plus "$arch"
-  install_xray_vless_reality "$arch"
-  install_hysteria2 "$arch"
-  install_tuic_server "$arch"
+  install_psiphon
+  install_xray_vless_reality
+  install_hysteria2
+  install_tuic_server
 
-  install_proxyctl
+  install_psictl
   install_menu
 
   print_client_info

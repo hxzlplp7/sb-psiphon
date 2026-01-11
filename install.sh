@@ -52,15 +52,28 @@ ensure_downloader(){
 need_root
 ensure_downloader
 
+# 检测 OS 类型（用于 Psiphon 二进制选择）
+detect_os(){
+  local os
+  os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+  case "$os" in
+    linux)   echo "linux" ;;
+    freebsd) echo "freebsd" ;;
+    *)       echo "unsupported" ;;
+  esac
+}
+
+# 检测架构（返回统一格式，与 release 资产命名一致）
 detect_arch(){
-  local m
-  m="$(uname -m)"
-  case "$m" in
-    x86_64|amd64) echo "x86_64" ;;
-    i386|i686)    echo "i686" ;;
-    aarch64|arm64) echo "arm64" ;;
-    armv7l|armv6l) echo "arm" ;;
-    *) echo "unknown" ;;
+  local arch
+  arch="$(uname -m | tr '[:upper:]' '[:lower:]')"
+  case "$arch" in
+    x86_64|amd64)   echo "amd64" ;;
+    aarch64|arm64)  echo "arm64" ;;
+    armv7l|armv7)   echo "armv7" ;;
+    armv6l)         echo "armv7" ;;  # armv6 fallback to armv7
+    i386|i686)      echo "386" ;;
+    *)              echo "unknown" ;;
   esac
 }
 
@@ -132,37 +145,134 @@ download_latest_github_release_asset(){
   echo "$url"
 }
 
-# ========= Psiphon ConsoleClient (官方二进制) =========
+# ========= Psiphon ConsoleClient (优先 hxzlplp7 releases) =========
+# 配置变量
+PSI_REPO_OWNER="hxzlplp7"
+PSI_REPO_NAME="psiphon-tunnel-core"
+PSI_TAG_DEFAULT="v1.0.0"
+PSI_OFFICIAL_FALLBACK_LINUX_AMD64="https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core-binaries/master/linux/psiphon-tunnel-core-x86_64"
+
 install_psiphon(){
-  local arch
+  local os arch
+  os="$(detect_os)"
   arch="$(detect_arch)"
 
   ylw "[*] 安装 Psiphon ConsoleClient..."
-  mkdir -p /etc/psiphon /var/lib/psiphon
+  ylw "[*] 检测到平台: ${os}/${arch}"
+  mkdir -p /etc/psiphon /var/lib/psiphon /usr/local/bin
 
-  if [[ "$arch" == "x86_64" || "$arch" == "i686" ]]; then
-    # 官方二进制：psiphon-tunnel-core-binaries 仓库只有 x86_64 和 i686
-    local url="https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core-binaries/master/linux/psiphon-tunnel-core-${arch}"
-    ylw "[*] 下载 Psiphon 二进制: $url"
-    download_file "$url" /usr/local/bin/psiphon-tunnel-core
-    chmod +x /usr/local/bin/psiphon-tunnel-core
-  else
-    # ARM 架构：需要 Go 编译
-    ylw "[!] 架构=$arch：官方无预编译二进制，使用 Go 编译..."
-    local pm
-    pm="$(detect_pm)"
-    if [[ "$pm" == "apt" ]]; then
-      apt-get install -y git golang build-essential
+  if [[ "$os" == "unsupported" ]]; then
+    red "[!] 不支持的操作系统: $(uname -s)"
+    red "    目前仅支持 Linux 和 FreeBSD"
+    exit 1
+  fi
+
+  if [[ "$arch" == "unknown" ]]; then
+    red "[!] 不支持的架构: $(uname -m)"
+    exit 1
+  fi
+
+  # 创建临时目录
+  local tmpd
+  tmpd="$(mktemp -d)"
+  # 使用 trap 确保退出时清理
+  trap 'rm -rf "$tmpd"' RETURN
+
+  local tag="${PSI_TAG_DEFAULT}"
+  local base="https://github.com/${PSI_REPO_OWNER}/${PSI_REPO_NAME}/releases/download/${tag}"
+  local asset="psiphon-tunnel-core-${os}-${arch}.tar.gz"
+  local url="${base}/${asset}"
+  local sha_url="${url}.sha256"
+
+  ylw "[*] 尝试从 hxzlplp7 releases 下载: ${url}"
+
+  local download_success=false
+
+  # 检查 release 资产是否存在
+  if curl -fsI "$url" >/dev/null 2>&1; then
+    # 下载 tar.gz
+    ylw "[*] 正在下载..."
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL "$url" -o "${tmpd}/${asset}"
     else
-      "$pm" -y install git golang gcc make || true
+      wget -qO "${tmpd}/${asset}" "$url"
     fi
 
-    rm -rf /tmp/psiphon-tunnel-core
-    git clone --depth 1 https://github.com/Psiphon-Labs/psiphon-tunnel-core.git /tmp/psiphon-tunnel-core
-    cd /tmp/psiphon-tunnel-core/ConsoleClient
-    go build -o /usr/local/bin/psiphon-tunnel-core .
-    chmod +x /usr/local/bin/psiphon-tunnel-core
-    cd /
+    # 尝试下载并校验 SHA256
+    if curl -fsI "$sha_url" >/dev/null 2>&1; then
+      ylw "[*] 下载 SHA256 校验文件..."
+      if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$sha_url" -o "${tmpd}/${asset}.sha256"
+      else
+        wget -qO "${tmpd}/${asset}.sha256" "$sha_url"
+      fi
+
+      local expected actual
+      expected="$(grep -Eo '[0-9a-fA-F]{64}' "${tmpd}/${asset}.sha256" | head -n1 | tr '[:upper:]' '[:lower:]')"
+
+      # 计算实际 SHA256（兼容 Linux 和 FreeBSD）
+      if command -v sha256sum >/dev/null 2>&1; then
+        actual="$(sha256sum "${tmpd}/${asset}" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
+      elif command -v shasum >/dev/null 2>&1; then
+        actual="$(shasum -a 256 "${tmpd}/${asset}" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
+      else
+        ylw "[!] 未找到 sha256sum/shasum，跳过校验"
+        expected=""
+      fi
+
+      if [[ -n "$expected" && "$expected" != "$actual" ]]; then
+        red "[!] SHA256 校验失败!"
+        red "    期望: ${expected}"
+        red "    实际: ${actual}"
+        exit 1
+      fi
+
+      if [[ -n "$expected" ]]; then
+        grn "[+] SHA256 校验通过"
+      fi
+    else
+      ylw "[!] 未找到 SHA256 文件，跳过校验（建议 releases 一定带 .sha256）"
+    fi
+
+    # 解压
+    ylw "[*] 解压中..."
+    tar -xzf "${tmpd}/${asset}" -C "$tmpd"
+
+    # 查找解压后的二进制文件
+    local extracted=""
+    if [[ -f "${tmpd}/psiphon-tunnel-core" ]]; then
+      extracted="${tmpd}/psiphon-tunnel-core"
+    else
+      # 兼容 tar 包里二进制名不固定的情况
+      extracted="$(find "$tmpd" -maxdepth 2 -type f -name 'psiphon-tunnel-core*' ! -name '*.tar.gz' ! -name '*.sha256' | head -n1)"
+    fi
+
+    if [[ -z "$extracted" || ! -f "$extracted" ]]; then
+      red "[!] 解压后未找到 psiphon-tunnel-core 可执行文件"
+      exit 1
+    fi
+
+    install -m 0755 "$extracted" /usr/local/bin/psiphon-tunnel-core
+    download_success=true
+    grn "[+] Psiphon 已从 hxzlplp7 releases 安装"
+
+  else
+    ylw "[!] 你的 releases 暂无 ${os}/${arch} 资产"
+  fi
+
+  # Fallback 到官方二进制（仅 linux/amd64）
+  if [[ "$download_success" != "true" ]]; then
+    if [[ "$os" == "linux" && "$arch" == "amd64" ]]; then
+      ylw "[*] Fallback 到官方 psiphon-tunnel-core-binaries..."
+      ylw "[*] 下载: ${PSI_OFFICIAL_FALLBACK_LINUX_AMD64}"
+      download_file "$PSI_OFFICIAL_FALLBACK_LINUX_AMD64" /usr/local/bin/psiphon-tunnel-core
+      chmod +x /usr/local/bin/psiphon-tunnel-core
+      grn "[+] Psiphon（官方二进制）已安装"
+    else
+      red "[!] 你的 releases 不包含该平台资产（${os}/${arch}），且无 fallback"
+      red "    请发布: psiphon-tunnel-core-${os}-${arch}.tar.gz"
+      exit 1
+    fi
   fi
 
   # 写配置文件

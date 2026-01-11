@@ -226,23 +226,24 @@ install_xray_vless_reality(){
   mkdir -p /usr/local/share/xray
   cp -f /tmp/xray/*.dat /usr/local/share/xray/ 2>/dev/null || true
 
-  # 生成 REALITY keypair（带验证和重试）
+  # 生成 REALITY keypair（兼容新旧版本 xray x25519 输出格式）
   local keypair priv pub sid uuid
-  local retry=0
-  while [[ $retry -lt 3 ]]; do
-    keypair="$(/usr/local/bin/xray x25519 2>&1)"
-    priv="$(echo "$keypair" | awk -F': ' '/Private key/ {print $2; exit}')"
-    pub="$(echo "$keypair" | awk -F': ' '/Public key/ {print $2; exit}')"
-    if [[ -n "$priv" && -n "$pub" && ${#priv} -gt 20 && ${#pub} -gt 20 ]]; then
-      break
-    fi
-    retry=$((retry+1))
-    ylw "[!] x25519 密钥生成失败，重试 $retry/3..."
-    sleep 1
-  done
+  keypair="$(/usr/local/bin/xray x25519 2>&1)"
+  
+  # 新版本格式: PrivateKey: xxx / Password: yyy
+  priv="$(echo "$keypair" | awk -F': *' '/^PrivateKey:/ {print $2; exit}')"
+  pub="$(echo "$keypair" | awk -F': *' '/^Password:/ {print $2; exit}')"
+  
+  # 旧版本格式: Private key: xxx / Public key: yyy
+  if [[ -z "$priv" ]]; then
+    priv="$(echo "$keypair" | awk -F': *' '/^Private key:/ {print $2; exit}')"
+  fi
+  if [[ -z "$pub" ]]; then
+    pub="$(echo "$keypair" | awk -F': *' '/^Public key:/ {print $2; exit}')"
+  fi
 
-  if [[ -z "$priv" || -z "$pub" || ${#priv} -lt 20 ]]; then
-    red "[!] REALITY 密钥生成失败，xray x25519 输出："
+  if [[ -z "$priv" || -z "$pub" || ${#priv} -lt 20 || ${#pub} -lt 20 ]]; then
+    red "[!] REALITY 密钥解析失败，xray x25519 输出："
     echo "$keypair"
     red "[!] 请手动运行 /usr/local/bin/xray x25519 检查"
     exit 1
@@ -994,12 +995,15 @@ main(){
   arch="$(detect_arch)"
   install_deps
 
-  # 自动探测公网 IP
-  ylw "[*] 正在探测本机公网 IP..."
+  # 自动探测公网 IP（IPv4 优先）
+  ylw "[*] 正在探测本机公网 IP (IPv4 优先)..."
   local detected_ip=""
-  detected_ip="$(curl -fsS --max-time 6 https://api64.ipify.org 2>/dev/null || true)"
-  [[ -z "$detected_ip" ]] && detected_ip="$(curl -fsS --max-time 6 https://ifconfig.me/ip 2>/dev/null || true)"
-  [[ -z "$detected_ip" ]] && detected_ip="$(curl -fsS --max-time 6 https://ipinfo.io/ip 2>/dev/null || true)"
+  # 先尝试 IPv4
+  detected_ip="$(curl -4 -fsS --max-time 6 https://api.ipify.org 2>/dev/null || true)"
+  [[ -z "$detected_ip" ]] && detected_ip="$(curl -4 -fsS --max-time 6 https://ifconfig.me/ip 2>/dev/null || true)"
+  [[ -z "$detected_ip" ]] && detected_ip="$(curl -4 -fsS --max-time 6 https://ipinfo.io/ip 2>/dev/null || true)"
+  # 如果没有 IPv4，再尝试 IPv6
+  [[ -z "$detected_ip" ]] && detected_ip="$(curl -6 -fsS --max-time 6 https://api6.ipify.org 2>/dev/null || true)"
   
   if [[ -n "$detected_ip" ]]; then
     grn "[+] 探测到公网 IP: $detected_ip"

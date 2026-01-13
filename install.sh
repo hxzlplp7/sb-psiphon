@@ -1067,155 +1067,220 @@ PSICTL_EOF
   grn "[+] psictl 已安装"
 }
 
-# ========= vpsmenu =========
+# ========= vpsmenu (统一入口版) =========
 install_menu(){
-  ylw "[*] 安装菜单命令 vpsmenu..."
+  ylw "[*] 安装菜单命令 vpsmenu (统一入口版)..."
   
-  if [[ "$EGRESS_MODE" == "direct" ]]; then
-    # 直连模式：简化版菜单（无 Psiphon 管理）
-    cat > /usr/local/bin/vpsmenu <<'MENU_EOF'
+  # 统一菜单：无论 direct/smart/psiphon，都用同一份脚本
+  # 运行时根据 psictl 是否存在来决定功能可用性
+  cat > /usr/local/bin/vpsmenu <<'MENU_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
+SERVICES_IN=("xray" "hysteria2" "tuic")
+SERVICE_PSI="psiphon"
 CLIENT_JSON="/etc/psiphon-egress/client.json"
 
-show_links() {
-  if [[ ! -f "$CLIENT_JSON" ]]; then
-    echo "[-] 未找到 $CLIENT_JSON"
-    return 1
-  fi
-  local host cert_mode
-  host="$(jq -r '.host' "$CLIENT_JSON")"
-  cert_mode="$(jq -r '.cert_mode' "$CLIENT_JSON")"
-  local insecure=0; [[ "$cert_mode" == "self" ]] && insecure=1
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-  local v_port v_uuid v_sni v_pbk v_sid
-  v_port="$(jq -r '.vless.port' "$CLIENT_JSON")"
-  v_uuid="$(jq -r '.vless.uuid' "$CLIENT_JSON")"
-  v_sni="$(jq -r '.vless.sni' "$CLIENT_JSON")"
-  v_pbk="$(jq -r '.vless.pbk' "$CLIENT_JSON")"
-  v_sid="$(jq -r '.vless.sid' "$CLIENT_JSON")"
+pause() { read -r -p $'\n回车继续...' _; }
 
-  local h_port h_auth h_obfs h_sni
-  h_port="$(jq -r '.hy2.port' "$CLIENT_JSON")"
-  h_auth="$(jq -r '.hy2.auth' "$CLIENT_JSON")"
-  h_obfs="$(jq -r '.hy2.obfs_password' "$CLIENT_JSON")"
-  h_sni="$(jq -r '.hy2.sni // "www.bing.com"' "$CLIENT_JSON")"
-
-  local t_port t_uuid t_pass t_sni
-  t_port="$(jq -r '.tuic.port // empty' "$CLIENT_JSON")"
-  t_uuid="$(jq -r '.tuic.uuid // empty' "$CLIENT_JSON")"
-  t_pass="$(jq -r '.tuic.password // empty' "$CLIENT_JSON")"
-  t_sni="$(jq -r '.tuic.sni // "www.bing.com"' "$CLIENT_JSON")"
-
-  echo ""
-  echo "==================== 分享链接 ===================="
-  echo ""
-  echo "[VLESS+REALITY]"
-  echo "vless://${v_uuid}@${host}:${v_port}?encryption=none&security=reality&sni=${v_sni}&fp=chrome&pbk=${v_pbk}&sid=${v_sid}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
-  echo ""
-  echo "[Hysteria2]"
-  echo "hysteria2://${h_auth}@${host}:${h_port}/?obfs=salamander&obfs-password=${h_obfs}&sni=${h_sni}&insecure=${insecure}&alpn=h3#HY2"
-  if [[ -n "$t_uuid" && "$t_uuid" != "null" ]]; then
-    echo ""
-    echo "[TUIC v5]"
-    echo "tuic://${t_uuid}:${t_pass}@${host}:${t_port}?alpn=h3&udp_relay_mode=native&congestion_control=bbr&sni=${t_sni}&allow_insecure=${insecure}#TUIC-v5"
-  fi
-  echo ""
-  echo "=================================================="
+print_box() {
+  echo "╔══════════════════════════════════════════════════════╗"
+  echo "║   多协议入站 + Psiphon 出站 管理菜单 (合并版)        ║"
+  echo "╚══════════════════════════════════════════════════════╝"
 }
 
-while true; do
-  clear
-  cat <<MENU
-╔══════════════════════════════════════════════════════╗
-║   多协议入站 管理菜单 (直连模式)                      ║
-╠══════════════════════════════════════════════════════╣
-║  1) 查看分享链接                                     ║
-║  2) 重启所有服务                                     ║
-║  3) 查看服务状态                                     ║
-║  4) 查看日志                                         ║
-║  0) 退出                                             ║
-╚══════════════════════════════════════════════════════╝
-MENU
-  read -r -p "请选择 [0-4]: " c || true
-  case "$c" in
-    1) show_links; read -r -p "回车继续..." _ ;;
-    2) systemctl restart xray hysteria2 tuic 2>/dev/null || true; echo "[+] 已重启"; read -r -p "回车继续..." _ ;;
-    3) systemctl --no-pager status xray hysteria2 tuic 2>/dev/null || true; read -r -p "回车继续..." _ ;;
-    4)
-      echo "xray, hy2=hysteria2, tuic"
-      read -r -p "选择(默认全部): " t
-      case "${t:-all}" in
-        xray) journalctl -u xray -n 100 --no-pager ;;
-        hy2|hysteria) journalctl -u hysteria2 -n 100 --no-pager ;;
-        tuic) journalctl -u tuic -n 100 --no-pager ;;
-        *) journalctl -u xray -u hysteria2 -u tuic -n 100 --no-pager ;;
-      esac
-      read -r -p "回车继续..." _
-      ;;
-    0) exit 0 ;;
-  esac
-done
-MENU_EOF
-  else
-    # smart/psiphon 模式：完整版菜单（含 Psiphon 管理）
-    cat > /usr/local/bin/vpsmenu <<'MENU_EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-while true; do
-  clear
-  cat <<MENU
-╔══════════════════════════════════════════════════════╗
-║   多协议入站 + Psiphon 出站 管理菜单                 ║
-╠══════════════════════════════════════════════════════╣
-║  1) 查看 Psiphon 状态     (psictl status)            ║
-║  2) 查看当前出口 IP       (psictl egress-test)       ║
-║  3) 智能切换出口国家      (先测试后选择)               ║
-║  4) 手动切换出口国家      (psictl country <CC>)      ║
-║  5) 批量测试国家可用性    (psictl country-test ...)  ║
-║  6) 查看分享链接          (psictl links)             ║
-║  7) 重启所有服务          (psictl restart)           ║
-║  8) 查看日志              (psictl logs ...)          ║
-║  0) 退出                                             ║
-╚══════════════════════════════════════════════════════╝
-MENU
-  read -r -p "请选择 [0-8]: " c || true
-  case "$c" in
-    1) psictl status; read -r -p "回车继续..." _ ;;
-    2) psictl egress-test; read -r -p "回车继续..." _ ;;
-    3) psictl smart-country; read -r -p "回车继续..." _ ;;
-    4)
-      echo "常用: US JP SG DE FR GB NL AT BE CA CH"
-      read -r -p "国家代码(AUTO=自动): " cc
-      [[ -n "$cc" ]] && psictl country "$cc"
-      psictl egress-test || true
-      read -r -p "回车继续..." _
-      ;;
-    5)
-      read -r -p "输入国家列表(空格分隔，如 US JP SG)或回车测全部: " line
-      if [[ -n "$line" ]]; then
-        # shellcheck disable=SC2086
-        psictl country-test $line
-      else
-        psictl country-test-all
-      fi
-      read -r -p "回车继续..." _
-      ;;
-    6) psictl links; read -r -p "回车继续..." _ ;;
-    7) psictl restart; read -r -p "回车继续..." _ ;;
-    8)
-      echo "psi=psiphon, xray, hy2=hysteria2, tuic"
-      read -r -p "选择(默认全部): " t
-      psictl logs "${t:-all}"
-      read -r -p "回车继续..." _
-      ;;
-    0) exit 0 ;;
-  esac
-done
-MENU_EOF
+show_mode_hint() {
+  local mode="unknown"
+  if [[ -f "$CLIENT_JSON" ]] && have_cmd jq; then
+    mode="$(jq -r '.egress_mode // "unknown"' "$CLIENT_JSON" 2>/dev/null || echo unknown)"
   fi
+  local psi="未安装"
+  have_cmd psictl && psi="已安装"
+  echo "当前检测：egress_mode=${mode} ｜ psictl=${psi}"
+}
+
+show_menu() {
+  clear
+  print_box
+  show_mode_hint
+  echo "╠══════════════════════════════════════════════════════╣"
+  echo "║  入站(通用)                                          ║"
+  echo "╠══════════════════════════════════════════════════════╣"
+  echo "║  1) 查看分享链接 (优先 psictl links)                 ║"
+  echo "║  2) 重启所有服务 (xray/hy2/tuic + 可选 psiphon)      ║"
+  echo "║  3) 查看服务状态                                     ║"
+  echo "║  4) 查看日志 (选择服务)                              ║"
+  echo "╠══════════════════════════════════════════════════════╣"
+  echo "║  Psiphon(赛风)                                       ║"
+  echo "╠══════════════════════════════════════════════════════╣"
+  echo "║  5) Psiphon 状态 (psictl status)                     ║"
+  echo "║  6) 切换出口国家 (psictl country XX/AUTO)            ║"
+  echo "║  7) 测试当前出口 IP (psictl egress-test)             ║"
+  echo "║  8) 智能选出口 (psictl smart-country)                ║"
+  echo "║  9) Psiphon 日志 (psictl logs psi 或 journalctl)     ║"
+  echo "╠══════════════════════════════════════════════════════╣"
+  echo "║  0) 退出                                             ║"
+  echo "╚══════════════════════════════════════════════════════╝"
+}
+
+view_links() {
+  if have_cmd psictl; then
+    psictl links
+  else
+    # 无 psictl 时，直接从 client.json 读取
+    if [[ ! -f "$CLIENT_JSON" ]]; then
+      echo "[-] 未找到 $CLIENT_JSON，无法生成分享链接"
+      echo "    请重新运行安装脚本"
+      return 1
+    fi
+
+    local host cert_mode insecure
+    host="$(jq -r '.host' "$CLIENT_JSON")"
+    cert_mode="$(jq -r '.cert_mode' "$CLIENT_JSON")"
+    [[ "$cert_mode" == "self" ]] && insecure=1 || insecure=0
+
+    local v_port v_uuid v_sni v_pbk v_sid
+    v_port="$(jq -r '.vless.port' "$CLIENT_JSON")"
+    v_uuid="$(jq -r '.vless.uuid' "$CLIENT_JSON")"
+    v_sni="$(jq -r '.vless.sni' "$CLIENT_JSON")"
+    v_pbk="$(jq -r '.vless.pbk' "$CLIENT_JSON")"
+    v_sid="$(jq -r '.vless.sid' "$CLIENT_JSON")"
+
+    local h_port h_auth h_obfs h_sni
+    h_port="$(jq -r '.hy2.port' "$CLIENT_JSON")"
+    h_auth="$(jq -r '.hy2.auth' "$CLIENT_JSON")"
+    h_obfs="$(jq -r '.hy2.obfs_password' "$CLIENT_JSON")"
+    h_sni="$(jq -r '.hy2.sni // "www.bing.com"' "$CLIENT_JSON")"
+
+    local t_port t_uuid t_pass t_sni
+    t_port="$(jq -r '.tuic.port // empty' "$CLIENT_JSON")"
+    t_uuid="$(jq -r '.tuic.uuid // empty' "$CLIENT_JSON")"
+    t_pass="$(jq -r '.tuic.password // empty' "$CLIENT_JSON")"
+    t_sni="$(jq -r '.tuic.sni // "www.bing.com"' "$CLIENT_JSON")"
+
+    echo ""
+    echo "==================== 分享链接 ===================="
+    echo ""
+    echo "[VLESS+REALITY]"
+    echo "vless://${v_uuid}@${host}:${v_port}?encryption=none&security=reality&sni=${v_sni}&fp=chrome&pbk=${v_pbk}&sid=${v_sid}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
+    echo ""
+    echo "[Hysteria2]"
+    echo "hysteria2://${h_auth}@${host}:${h_port}/?obfs=salamander&obfs-password=${h_obfs}&sni=${h_sni}&insecure=${insecure}&alpn=h3#HY2"
+    if [[ -n "$t_uuid" && "$t_uuid" != "null" ]]; then
+      echo ""
+      echo "[TUIC v5]"
+      echo "tuic://${t_uuid}:${t_pass}@${host}:${t_port}?alpn=h3&udp_relay_mode=native&congestion_control=bbr&sni=${t_sni}&allow_insecure=${insecure}#TUIC-v5"
+    fi
+    echo ""
+    echo "=================================================="
+  fi
+}
+
+restart_all() {
+  echo "重启入站服务: ${SERVICES_IN[*]}"
+  systemctl restart "${SERVICES_IN[@]}" 2>/dev/null || true
+
+  if systemctl list-unit-files 2>/dev/null | grep -q "^${SERVICE_PSI}\.service"; then
+    echo "重启 Psiphon: ${SERVICE_PSI}"
+    systemctl restart "${SERVICE_PSI}" 2>/dev/null || true
+  else
+    echo "未发现 psiphon.service，跳过 Psiphon 重启。"
+  fi
+
+  echo "[+] 完成。"
+}
+
+status_all() {
+  echo "===== 入站服务状态 ====="
+  for svc in "${SERVICES_IN[@]}"; do
+    echo ""
+    echo "--- $svc ---"
+    systemctl --no-pager status "$svc" 2>/dev/null || echo "$svc 未安装或未运行"
+  done
+  echo ""
+  echo "--- psiphon ---"
+  systemctl --no-pager status "${SERVICE_PSI}" 2>/dev/null || echo "psiphon 未安装或未运行"
+}
+
+logs_menu() {
+  echo "可选：xray | hy2(hysteria2) | tuic | psi(psiphon) | all"
+  read -r -p "选择(默认 all): " s
+  s="${s:-all}"
+  case "$s" in
+    xray) journalctl -u xray -n 200 --no-pager ;;
+    hy2|hysteria2) journalctl -u hysteria2 -n 200 --no-pager ;;
+    tuic) journalctl -u tuic -n 200 --no-pager ;;
+    psi|psiphon)
+      if have_cmd psictl; then psictl logs psi; else journalctl -u psiphon -n 200 --no-pager; fi
+      ;;
+    all|"")
+      if have_cmd psictl; then psictl logs; else
+        for u in xray hysteria2 tuic psiphon; do
+          echo -e "\n===== $u ====="
+          journalctl -u "$u" -n 120 --no-pager 2>/dev/null || echo "$u 未运行"
+        done
+      fi
+      ;;
+    *) echo "未知选择: $s" ;;
+  esac
+}
+
+psi_guard() {
+  if ! have_cmd psictl; then
+    echo "未检测到 psictl（通常=你现在是 direct 模式/没装 Psiphon 组件）。"
+    echo "要让 Psiphon 选项真正可用，需要先安装/启用 Psiphon 出站（脚本会提供 psictl）。"
+    return 1
+  fi
+  return 0
+}
+
+psi_status() { psi_guard || return 0; psictl status; }
+
+psi_country() {
+  psi_guard || return 0
+  echo "常用: US JP SG DE FR GB NL AT BE CA CH"
+  read -r -p "输入国家代码(如 JP/SG/US) 或 AUTO: " c
+  c="${c:-AUTO}"
+  psictl country "$c"
+  psictl egress-test || true
+}
+
+psi_egress_test() { psi_guard || return 0; psictl egress-test; }
+
+psi_smart_country() { psi_guard || return 0; psictl smart-country; }
+
+psi_logs() {
+  if have_cmd psictl; then
+    psictl logs psi
+  else
+    journalctl -u psiphon -n 200 --no-pager 2>/dev/null || echo "psiphon.service 不存在或未运行"
+  fi
+}
+
+main() {
+  while true; do
+    show_menu
+    read -r -p "请选择 [0-9]: " choice
+    case "${choice:-}" in
+      1) view_links; pause ;;
+      2) restart_all; pause ;;
+      3) status_all; pause ;;
+      4) logs_menu; pause ;;
+      5) psi_status; pause ;;
+      6) psi_country; pause ;;
+      7) psi_egress_test; pause ;;
+      8) psi_smart_country; pause ;;
+      9) psi_logs; pause ;;
+      0) exit 0 ;;
+      *) echo "无效输入"; pause ;;
+    esac
+  done
+}
+
+main
+MENU_EOF
   chmod +x /usr/local/bin/vpsmenu
   grn "[+] vpsmenu 已安装：运行 vpsmenu 打开菜单"
 }

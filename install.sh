@@ -431,7 +431,7 @@ install_xray_vless_reality(){
       xray_sniffing='"sniffing": { "enabled": true, "destOverride": ["http","tls","quic"], "routeOnly": true }'
       ;;
     psiphon)
-      # 方案B: UDP 直连，TCP 走 Psiphon（避免 socks5 处理 UDP 导致超时）
+      # 全局 Psiphon: TCP+UDP 都走 Psiphon socks5
       xray_outbounds='
     {
       "protocol": "socks",
@@ -441,13 +441,11 @@ install_xray_vless_reality(){
           { "address": "127.0.0.1", "port": '"${PSIPHON_SOCKS}"' }
         ]
       }
-    },
-    { "protocol": "freedom", "tag": "direct", "settings": {} }
+    }
   '
       xray_routing='"domainStrategy": "AsIs",
     "rules": [
-      { "type": "field", "network": "udp", "outboundTag": "direct" },
-      { "type": "field", "network": "tcp", "outboundTag": "psiphon" }
+      { "type": "field", "outboundTag": "psiphon", "network": "tcp,udp" }
     ]'
       xray_sniffing='"sniffing": { "enabled": true, "destOverride": ["http","tls"] }'
       ;;
@@ -634,7 +632,7 @@ acl:
 EOF
       ;;
     psiphon)
-      # 方案B: UDP 直连，TCP 走 Psiphon
+      # 全局 Psiphon: TCP+UDP 都走 Psiphon socks5
       cat >> /etc/hysteria/config.yaml <<EOF
 
 outbounds:
@@ -642,12 +640,9 @@ outbounds:
     type: socks5
     socks5:
       addr: 127.0.0.1:${PSIPHON_SOCKS}
-  - name: direct
-    type: direct
 
 acl:
   inline:
-    - direct(all, udp/*)
     - psiphon(all)
 EOF
       ;;
@@ -1352,18 +1347,11 @@ xray_apply_mode() {
       sniffing='{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":true}'
       ;;
     psiphon)
-      # 方案B: UDP 直连，TCP 走 Psiphon（避免 socks5 处理 UDP 导致超时）
+      # 全局 Psiphon: TCP+UDP 都走 Psiphon socks5
       outbounds='[
-        {"protocol":"socks","tag":"psiphon","settings":{"servers":[{"address":"127.0.0.1","port":'"$socks"'}]}},
-        {"protocol":"freedom","tag":"direct","settings":{}}
+        {"protocol":"socks","tag":"psiphon","settings":{"servers":[{"address":"127.0.0.1","port":'"$socks"'}]}}
       ]'
-      routing='{
-        "domainStrategy":"AsIs",
-        "rules":[
-          {"type":"field","network":"udp","outboundTag":"direct"},
-          {"type":"field","network":"tcp","outboundTag":"psiphon"}
-        ]
-      }'
+      routing='{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"psiphon","network":"tcp,udp"}]}'
       sniffing='{"enabled":true,"destOverride":["http","tls"]}'
       ;;
     *)
@@ -1439,7 +1427,7 @@ acl:
 EOF
       ;;
     psiphon)
-      # 方案B: UDP 直连，TCP 走 Psiphon
+      # 全局 Psiphon: TCP+UDP 都走 Psiphon socks5
       cat >>"$tmp" <<EOF
 
 outbounds:
@@ -1447,12 +1435,9 @@ outbounds:
     type: socks5
     socks5:
       addr: 127.0.0.1:${socks}
-  - name: direct
-    type: direct
 
 acl:
   inline:
-    - direct(all, udp/*)
     - psiphon(all)
 EOF
       ;;

@@ -1067,9 +1067,9 @@ PSICTL_EOF
   grn "[+] psictl 已安装"
 }
 
-# ========= vpsmenu (统一入口版 + whiptail 美化 + 内置 psi-setup) =========
+# ========= vpsmenu (统一入口版 + 内置 psi-setup + 模式切换) =========
 install_menu(){
-  ylw "[*] 安装菜单命令 vpsmenu (统一入口版 + whiptail 美化)..."
+  ylw "[*] 安装菜单命令 vpsmenu (纯文本菜单)..."
   
   # 统一菜单：无论 direct/smart/psiphon，都用同一份脚本
   # 运行时根据 psictl 是否存在来决定功能可用性
@@ -1088,69 +1088,46 @@ is_root() { [[ ${EUID:-$(id -u)} -eq 0 ]]; }
 
 pause() { read -r -p $'\n回车继续...' _; }
 
-# ==================== whiptail 检测 ====================
-USE_WHIPTAIL=false
-if have_cmd whiptail; then
-  USE_WHIPTAIL=true
-fi
-
-# ==================== 文本版菜单 ====================
+# ==================== 文本版菜单（取消 whiptail）====================
 show_text_menu() {
   clear
   local mode="unknown" psi_status="未安装"
   [[ -f "$CLIENT_JSON" ]] && have_cmd jq && mode="$(jq -r '.egress_mode // "unknown"' "$CLIENT_JSON" 2>/dev/null || echo unknown)"
   have_cmd psictl && psi_status="已安装"
 
-  echo "╔══════════════════════════════════════════════════════╗"
-  echo "║   多协议入站 + Psiphon 出站 管理菜单 (合并版)        ║"
-  echo "╠══════════════════════════════════════════════════════╣"
+  echo "╔══════════════════════════════════════════════════════════╗"
+  echo "║   多协议入站 + Psiphon 出站 管理菜单 (合并版)            ║"
+  echo "╠══════════════════════════════════════════════════════════╣"
   echo "║  egress_mode=${mode} | psictl=${psi_status}"
-  echo "╠══════════════════════════════════════════════════════╣"
-  echo "║  入站(通用)                                          ║"
-  echo "╠══════════════════════════════════════════════════════╣"
-  echo "║  1) 查看分享链接                                     ║"
-  echo "║  2) 重启所有服务                                     ║"
-  echo "║  3) 查看服务状态                                     ║"
-  echo "║  4) 查看日志                                         ║"
-  echo "╠══════════════════════════════════════════════════════╣"
-  echo "║  Psiphon(赛风)                                       ║"
-  echo "╠══════════════════════════════════════════════════════╣"
-  echo "║  5) Psiphon 状态                                     ║"
-  echo "║  6) 切换出口国家                                     ║"
-  echo "║  7) 测试当前出口 IP                                  ║"
-  echo "║  8) 智能选出口                                       ║"
-  echo "║  9) Psiphon 日志                                     ║"
-  echo "╠══════════════════════════════════════════════════════╣"
-  echo "║  A) 安装/更新 Psiphon 组件 (不动入站)                ║"
-  echo "║  0) 退出                                             ║"
-  echo "╚══════════════════════════════════════════════════════╝"
+  echo "╠══════════════════════════════════════════════════════════╣"
+  echo "║  入站(通用)                                              ║"
+  echo "╠══════════════════════════════════════════════════════════╣"
+  echo "║   1) 查看分享链接                                        ║"
+  echo "║   2) 重启所有服务                                        ║"
+  echo "║   3) 查看服务状态                                        ║"
+  echo "║   4) 查看日志                                            ║"
+  echo "╠══════════════════════════════════════════════════════════╣"
+  echo "║  Psiphon(赛风)                                           ║"
+  echo "╠══════════════════════════════════════════════════════════╣"
+  echo "║   5) Psiphon 状态                                        ║"
+  echo "║   6) 切换出口国家                                        ║"
+  echo "║   7) 测试当前出口 IP                                     ║"
+  echo "║   8) 智能选出口                                          ║"
+  echo "║   9) Psiphon 日志                                        ║"
+  echo "╠══════════════════════════════════════════════════════════╣"
+  echo "║  出站模式                                                ║"
+  echo "╠══════════════════════════════════════════════════════════╣"
+  echo "║  10) 出口 IP 检测 (direct / psiphon)                     ║"
+  echo "║  11) 切换出站模式 (direct/smart/psiphon)                 ║"
+  echo "╠══════════════════════════════════════════════════════════╣"
+  echo "║   A) 安装/更新 Psiphon 组件 (不动入站)                   ║"
+  echo "║   0) 退出                                                ║"
+  echo "╚══════════════════════════════════════════════════════════╝"
 }
 
-# ==================== whiptail 版菜单 ====================
-show_whiptail_menu() {
-  local mode="unknown" psi_status="未安装"
-  [[ -f "$CLIENT_JSON" ]] && have_cmd jq && mode="$(jq -r '.egress_mode // "unknown"' "$CLIENT_JSON" 2>/dev/null || echo unknown)"
-  have_cmd psictl && psi_status="已安装"
-
-  local title="多协议管理菜单 [模式:${mode}|psictl:${psi_status}]"
-  
-  local choice
-  choice=$(whiptail --title "$title" --menu "请选择操作" 22 60 14 \
-    "1" "查看分享链接" \
-    "2" "重启所有服务 (xray/hy2/tuic/psiphon)" \
-    "3" "查看服务状态" \
-    "4" "查看日志" \
-    "-" "──────── Psiphon ────────" \
-    "5" "Psiphon 状态" \
-    "6" "切换出口国家" \
-    "7" "测试当前出口 IP" \
-    "8" "智能选出口 (先测试后选择)" \
-    "9" "Psiphon 日志" \
-    "-" "────────────────────────" \
-    "A" "安装/更新 Psiphon 组件 (不动入站)" \
-    "0" "退出" 3>&1 1>&2 2>&3) || true
-  
-  echo "$choice"
+# ==================== 菜单入口（强制文本版）====================
+show_menu() {
+  show_text_menu
 }
 
 # ==================== 功能函数 ====================
@@ -1279,6 +1256,291 @@ psi_country() {
 
 psi_egress_test() { psi_guard || return 0; psictl egress-test; }
 psi_smart_country() { psi_guard || return 0; psictl smart-country; }
+
+# ==================== 新增：出口 IP 检测 & 模式切换 ====================
+read_psi_ports() {
+  local socks http
+  socks="$(jq -r '.LocalSocksProxyPort // 1081' "$PSI_CFG" 2>/dev/null || echo 1081)"
+  http="$(jq -r '.LocalHttpProxyPort // 8081' "$PSI_CFG" 2>/dev/null || echo 8081)"
+  echo "$socks $http"
+}
+
+direct_egress_test() {
+  echo "===== Direct 出口 IP ====="
+  curl -fsS --max-time 10 https://ipinfo.io/json | jq -r '"IP: \(.ip)\nCountry: \(.country)\nOrg: \(.org)\nCity: \(.city)"' || echo "[-] 检测失败"
+  echo ""
+}
+
+psiphon_egress_test() {
+  echo "===== Psiphon 出口 IP ====="
+  if have_cmd psictl; then
+    psictl egress-test || echo "[-] Psiphon出口检测失败"
+  else
+    local socks
+    read -r socks _ < <(read_psi_ports)
+    curl -fsS --max-time 12 --socks5-hostname "127.0.0.1:${socks}" https://ipinfo.io/json \
+      | jq -r '"IP: \(.ip)\nCountry: \(.country)\nOrg: \(.org)\nCity: \(.city)"' || echo "[-] Psiphon出口检测失败"
+  fi
+  echo ""
+}
+
+egress_ip_detect() {
+  direct_egress_test
+  if systemctl list-unit-files 2>/dev/null | grep -q '^psiphon\.service'; then
+    psiphon_egress_test
+  else
+    echo "[-] 未安装 psiphon.service，跳过 Psiphon 出口检测。"
+    echo ""
+  fi
+}
+
+ensure_client_json() {
+  mkdir -p /etc/psiphon-egress
+  if [[ ! -f "$CLIENT_JSON" ]]; then
+    cat >"$CLIENT_JSON" <<'EOF'
+{ "egress_mode": "direct" }
+EOF
+  fi
+}
+
+set_client_mode() {
+  local mode="$1"
+  ensure_client_json
+  local tmp
+  tmp="$(mktemp)"
+  jq --arg m "$mode" '.egress_mode=$m' "$CLIENT_JSON" >"$tmp" && mv "$tmp" "$CLIENT_JSON"
+}
+
+xray_apply_mode() {
+  local mode="$1"
+  local socks
+  read -r socks _ < <(read_psi_ports)
+
+  local outbounds routing sniffing
+
+  case "$mode" in
+    direct)
+      outbounds='[{"protocol":"freedom","tag":"direct","settings":{}}]'
+      routing='{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"direct","network":"tcp,udp"}]}'
+      sniffing='{"enabled":true,"destOverride":["http","tls"]}'
+      ;;
+    smart)
+      outbounds='[
+        {"protocol":"freedom","tag":"direct","settings":{}},
+        {"protocol":"socks","tag":"psiphon","settings":{"servers":[{"address":"127.0.0.1","port":'"$socks"'}]}}
+      ]'
+      routing='{
+        "domainStrategy":"IPIfNonMatch",
+        "rules":[
+          {"type":"field","outboundTag":"psiphon","domain":[
+            "geosite:google","geosite:youtube","geosite:twitter","domain:x.com","geosite:netflix","geosite:tiktok",
+            "geosite:bing","geosite:openai","geosite:anthropic","geosite:perplexity","geosite:huggingface",
+            "geosite:google-gemini","geosite:google-deepmind","geosite:deepseek","geosite:groq","geosite:elevenlabs"
+          ]},
+          {"type":"field","network":"tcp,udp","outboundTag":"direct"}
+        ]
+      }'
+      sniffing='{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":true}'
+      ;;
+    psiphon)
+      outbounds='[
+        {"protocol":"socks","tag":"psiphon","settings":{"servers":[{"address":"127.0.0.1","port":'"$socks"'}]}}
+      ]'
+      routing='{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"psiphon","network":"tcp,udp"}]}'
+      sniffing='{"enabled":true,"destOverride":["http","tls"]}'
+      ;;
+    *)
+      echo "[-] 未知 mode: $mode"; return 1 ;;
+  esac
+
+  if [[ ! -f /etc/xray/config.json ]]; then
+    echo "[-] 未找到 /etc/xray/config.json，跳过 Xray 配置更新"
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+  jq --argjson ob "$outbounds" --argjson rt "$routing" --argjson sn "$sniffing" '
+    .outbounds=$ob
+    | .routing=$rt
+    | (.inbounds[] |= (.sniffing=$sn))
+  ' /etc/xray/config.json >"$tmp" && mv "$tmp" /etc/xray/config.json
+  echo "[+] Xray 配置已更新"
+}
+
+hy2_apply_mode() {
+  local mode="$1"
+  local socks
+  read -r socks _ < <(read_psi_ports)
+
+  local f="/etc/hysteria/config.yaml"
+  [[ -f "$f" ]] || { echo "[-] 未找到 $f，跳过 Hysteria2 配置更新"; return 0; }
+
+  local tmp
+  tmp="$(mktemp)"
+  # 删除旧的 outbounds/acl 段，再按 mode 重新追加
+  awk '
+    BEGIN{skip=0}
+    /^outbounds:/{skip=1}
+    /^acl:/{skip=1}
+    {if(!skip) print}
+  ' "$f" >"$tmp"
+
+  case "$mode" in
+    direct)
+      ;;
+    smart)
+      cat >>"$tmp" <<EOF
+
+outbounds:
+  - name: direct
+    type: direct
+  - name: psiphon
+    type: socks5
+    socks5:
+      addr: 127.0.0.1:${socks}
+
+acl:
+  inline:
+    - psiphon(geosite:google)
+    - psiphon(geosite:youtube)
+    - psiphon(geosite:twitter)
+    - psiphon(suffix:x.com)
+    - psiphon(geosite:netflix)
+    - psiphon(geosite:tiktok)
+    - psiphon(geosite:bing)
+    - psiphon(geosite:openai)
+    - psiphon(geosite:anthropic)
+    - psiphon(geosite:perplexity)
+    - psiphon(geosite:huggingface)
+    - psiphon(geosite:google-gemini)
+    - psiphon(geosite:google-deepmind)
+    - psiphon(geosite:deepseek)
+    - psiphon(geosite:groq)
+    - psiphon(geosite:elevenlabs)
+    - direct(all)
+EOF
+      ;;
+    psiphon)
+      cat >>"$tmp" <<EOF
+
+outbounds:
+  - name: psiphon
+    type: socks5
+    socks5:
+      addr: 127.0.0.1:${socks}
+EOF
+      ;;
+  esac
+
+  mv "$tmp" "$f"
+  echo "[+] Hysteria2 配置已更新"
+}
+
+rewrite_units_by_mode() {
+  local mode="$1"
+
+  # 非 direct 就 Wants/After psiphon.service
+  local unit_after unit_wants
+  if [[ "$mode" != "direct" ]]; then
+    unit_after="After=network-online.target psiphon.service"
+    unit_wants="Wants=network-online.target psiphon.service"
+  else
+    unit_after="After=network-online.target"
+    unit_wants="Wants=network-online.target"
+  fi
+
+  if [[ -f /etc/systemd/system/xray.service ]]; then
+    cat > /etc/systemd/system/xray.service <<EOF
+[Unit]
+Description=Xray-core (VLESS+REALITY) Server
+${unit_after}
+${unit_wants}
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xray run -config /etc/xray/config.json
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    echo "[+] xray.service 已更新"
+  fi
+
+  if [[ -f /etc/systemd/system/hysteria2.service ]]; then
+    cat > /etc/systemd/system/hysteria2.service <<EOF
+[Unit]
+Description=Hysteria2 Server
+${unit_after}
+${unit_wants}
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    echo "[+] hysteria2.service 已更新"
+  fi
+
+  systemctl daemon-reload
+}
+
+switch_egress_mode() {
+  local current_mode
+  current_mode="$(jq -r '.egress_mode // "direct"' "$CLIENT_JSON" 2>/dev/null || echo direct)"
+  echo ""
+  echo "当前模式: $current_mode"
+  echo ""
+  echo "1) direct   (全直连)"
+  echo "2) smart    (AI/流媒体 -> Psiphon，其余直连)"
+  echo "3) psiphon  (全走 Psiphon)"
+  echo "0) 取消"
+  read -r -p "选择 [0-3]: " n
+
+  local mode
+  case "$n" in
+    1) mode="direct" ;;
+    2) mode="smart" ;;
+    3) mode="psiphon" ;;
+    0) return 0 ;;
+    *) echo "[-] 无效选择"; return 0 ;;
+  esac
+
+  # smart/psiphon 必须要有 psictl / Psiphon
+  if [[ "$mode" != "direct" ]] && ! have_cmd psictl; then
+    echo ""
+    echo "[-] 未检测到 psictl / Psiphon 组件。"
+    echo "    请先在菜单里选 'A' 安装 Psiphon 组件，然后再切换模式。"
+    return 0
+  fi
+
+  set_client_mode "$mode"
+  xray_apply_mode "$mode"
+  hy2_apply_mode "$mode"
+  rewrite_units_by_mode "$mode"
+
+  if [[ "$mode" == "direct" ]]; then
+    systemctl stop psiphon 2>/dev/null || true
+    echo "[*] psiphon.service 已停止"
+  else
+    systemctl enable --now psiphon 2>/dev/null || systemctl start psiphon 2>/dev/null || true
+    echo "[*] psiphon.service 已启动"
+  fi
+
+  systemctl restart xray hysteria2 2>/dev/null || true
+
+  echo ""
+  echo "[+] 已切换为: $mode"
+  echo "    注意：TUIC 在这套方案里不跟随模式切换（固定 direct）"
+}
 
 psi_logs() {
   if have_cmd psictl; then
@@ -1507,13 +1769,8 @@ PSICTL
 # ==================== 主循环 ====================
 main() {
   while true; do
-    local choice
-    if $USE_WHIPTAIL; then
-      choice="$(show_whiptail_menu)"
-    else
-      show_text_menu
-      read -r -p "请选择 [0-9/A]: " choice || true
-    fi
+    show_text_menu
+    read -r -p "请选择 [0-11/A]: " choice || true
 
     case "${choice:-}" in
       1) view_links; pause ;;
@@ -1525,9 +1782,10 @@ main() {
       7) psi_egress_test; pause ;;
       8) psi_smart_country; pause ;;
       9) psi_logs; pause ;;
+      10) egress_ip_detect; pause ;;
+      11) switch_egress_mode; pause ;;
       [Aa]) psi_setup; pause ;;
       0) exit 0 ;;
-      "-") ;; # whiptail 分隔符，忽略
       *) [[ -n "${choice:-}" ]] && echo "无效输入: $choice" && pause ;;
     esac
   done

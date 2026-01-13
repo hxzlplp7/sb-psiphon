@@ -12,7 +12,7 @@ DEFAULT_CERT_MODE="self"   # self | le
 DEFAULT_PSIPHON_REGION="US"
 DEFAULT_PSIPHON_SOCKS="1081"
 DEFAULT_PSIPHON_HTTP="8081"
-DEFAULT_EGRESS_MODE="smart"   # direct | smart | psiphon
+DEFAULT_EGRESS_MODE="direct"   # direct | psiphon
 
 # ========= 全局临时目录管理（防止 set -u 报 unbound variable）=========
 _tmpd=""
@@ -391,45 +391,6 @@ install_xray_vless_reality(){
     ]'
       xray_sniffing='"sniffing": { "enabled": true, "destOverride": ["http","tls"] }'
       ;;
-    smart)
-      # 智能分流：AI/流媒体→psiphon，其余→direct
-      xray_outbounds='
-    { "protocol": "freedom", "tag": "direct", "settings": {} },
-    {
-      "protocol": "socks",
-      "tag": "psiphon",
-      "settings": { "servers": [{ "address": "127.0.0.1", "port": '"${PSIPHON_SOCKS}"' }] }
-    }
-  '
-      xray_routing='"domainStrategy": "IPIfNonMatch",
-    "rules": [
-      {
-        "type": "field",
-        "outboundTag": "psiphon",
-        "domain": [
-          "geosite:google",
-          "geosite:youtube",
-          "geosite:twitter",
-          "domain:x.com",
-          "geosite:netflix",
-          "geosite:tiktok",
-          "geosite:bing",
-          "geosite:openai",
-          "geosite:anthropic",
-          "geosite:perplexity",
-          "geosite:huggingface",
-          "geosite:google-gemini",
-          "geosite:google-deepmind",
-          "geosite:deepseek",
-          "geosite:groq",
-          "geosite:elevenlabs"
-        ]
-      },
-      { "type": "field", "network": "tcp,udp", "outboundTag": "direct" }
-    ]'
-      # smart 模式开启增强 sniffing 以支持域名分流
-      xray_sniffing='"sniffing": { "enabled": true, "destOverride": ["http","tls","quic"], "routeOnly": true }'
-      ;;
     psiphon)
       # 全局 Psiphon: TCP+UDP 都走 Psiphon socks5
       xray_outbounds='
@@ -485,7 +446,7 @@ install_xray_vless_reality(){
 }
 EOF
 
-  # systemd unit: 仅 smart/psiphon 模式依赖 psiphon.service
+  # systemd unit: psiphon 模式依赖 psiphon.service
   local unit_after unit_wants
   if [[ "$EGRESS_MODE" != "direct" ]]; then
     unit_after="After=network-online.target psiphon.service"
@@ -593,44 +554,6 @@ EOF
     direct)
       # 直连模式：不添加 outbounds（Hysteria2 默认直连）
       ;;
-    smart)
-      # 智能分流：ACL 规则
-      cat >> /etc/hysteria/config.yaml <<EOF
-
-outbounds:
-  - name: direct
-    type: direct
-  - name: psiphon
-    type: socks5
-    socks5:
-      addr: 127.0.0.1:${PSIPHON_SOCKS}
-
-acl:
-  inline:
-    # Google / YouTube
-    - psiphon(geosite:google)
-    - psiphon(geosite:youtube)
-    # X/Twitter
-    - psiphon(geosite:twitter)
-    - psiphon(suffix:x.com)
-    # Netflix / TikTok / Bing
-    - psiphon(geosite:netflix)
-    - psiphon(geosite:tiktok)
-    - psiphon(geosite:bing)
-    # 常见 AI
-    - psiphon(geosite:openai)
-    - psiphon(geosite:anthropic)
-    - psiphon(geosite:perplexity)
-    - psiphon(geosite:huggingface)
-    - psiphon(geosite:google-gemini)
-    - psiphon(geosite:google-deepmind)
-    - psiphon(geosite:deepseek)
-    - psiphon(geosite:groq)
-    - psiphon(geosite:elevenlabs)
-    # 兜底：其他全直连
-    - direct(all)
-EOF
-      ;;
     psiphon)
       # 全局 Psiphon: TCP+UDP 都走 Psiphon socks5
       cat >> /etc/hysteria/config.yaml <<EOF
@@ -648,7 +571,7 @@ EOF
       ;;
   esac
 
-  # systemd unit: 仅 smart/psiphon 模式依赖 psiphon.service
+  # systemd unit: psiphon 模式依赖 psiphon.service
   local unit_after unit_wants
   if [[ "$EGRESS_MODE" != "direct" ]]; then
     unit_after="After=network-online.target psiphon.service"
@@ -1075,7 +998,7 @@ PSICTL_EOF
 install_menu(){
   ylw "[*] 安装菜单命令 vpsmenu (纯文本菜单)..."
   
-  # 统一菜单：无论 direct/smart/psiphon，都用同一份脚本
+  # 统一菜单：无论 direct/psiphon，都用同一份脚本
   # 运行时根据 psictl 是否存在来决定功能可用性
   # 支持 whiptail 美化（没装就降级文本版）
   cat > /usr/local/bin/vpsmenu <<'MENU_EOF'
@@ -1122,7 +1045,7 @@ show_text_menu() {
   echo "║  出站模式                                                ║"
   echo "╠══════════════════════════════════════════════════════════╣"
   echo "║  10) 出口 IP 检测 (direct / psiphon)                     ║"
-  echo "║  11) 切换出站模式 (direct/smart/psiphon)                 ║"
+  echo "║  11) 切换出站模式 (direct/psiphon)                       ║"
   echo "╠══════════════════════════════════════════════════════════╣"
   echo "║   A) 安装/更新 Psiphon 组件 (不动入站)                   ║"
   echo "║   0) 退出                                                ║"
@@ -1328,24 +1251,6 @@ xray_apply_mode() {
       routing='{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"direct","network":"tcp,udp"}]}'
       sniffing='{"enabled":true,"destOverride":["http","tls"]}'
       ;;
-    smart)
-      outbounds='[
-        {"protocol":"freedom","tag":"direct","settings":{}},
-        {"protocol":"socks","tag":"psiphon","settings":{"servers":[{"address":"127.0.0.1","port":'"$socks"'}]}}
-      ]'
-      routing='{
-        "domainStrategy":"IPIfNonMatch",
-        "rules":[
-          {"type":"field","outboundTag":"psiphon","domain":[
-            "geosite:google","geosite:youtube","geosite:twitter","domain:x.com","geosite:netflix","geosite:tiktok",
-            "geosite:bing","geosite:openai","geosite:anthropic","geosite:perplexity","geosite:huggingface",
-            "geosite:google-gemini","geosite:google-deepmind","geosite:deepseek","geosite:groq","geosite:elevenlabs"
-          ]},
-          {"type":"field","network":"tcp,udp","outboundTag":"direct"}
-        ]
-      }'
-      sniffing='{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":true}'
-      ;;
     psiphon)
       # 全局 Psiphon: TCP+UDP 都走 Psiphon socks5
       outbounds='[
@@ -1393,38 +1298,6 @@ hy2_apply_mode() {
 
   case "$mode" in
     direct)
-      ;;
-    smart)
-      cat >>"$tmp" <<EOF
-
-outbounds:
-  - name: direct
-    type: direct
-  - name: psiphon
-    type: socks5
-    socks5:
-      addr: 127.0.0.1:${socks}
-
-acl:
-  inline:
-    - psiphon(geosite:google)
-    - psiphon(geosite:youtube)
-    - psiphon(geosite:twitter)
-    - psiphon(suffix:x.com)
-    - psiphon(geosite:netflix)
-    - psiphon(geosite:tiktok)
-    - psiphon(geosite:bing)
-    - psiphon(geosite:openai)
-    - psiphon(geosite:anthropic)
-    - psiphon(geosite:perplexity)
-    - psiphon(geosite:huggingface)
-    - psiphon(geosite:google-gemini)
-    - psiphon(geosite:google-deepmind)
-    - psiphon(geosite:deepseek)
-    - psiphon(geosite:groq)
-    - psiphon(geosite:elevenlabs)
-    - direct(all)
-EOF
       ;;
     psiphon)
       # 全局 Psiphon: TCP+UDP 都走 Psiphon socks5
@@ -1510,21 +1383,19 @@ switch_egress_mode() {
   echo "当前模式: $current_mode"
   echo ""
   echo "1) direct   (全直连)"
-  echo "2) smart    (AI/流媒体 -> Psiphon，其余直连)"
-  echo "3) psiphon  (全走 Psiphon)"
+  echo "2) psiphon  (全走 Psiphon)"
   echo "0) 取消"
-  read -r -p "选择 [0-3]: " n
+  read -r -p "选择 [0-2]: " n
 
   local mode
   case "$n" in
     1) mode="direct" ;;
-    2) mode="smart" ;;
-    3) mode="psiphon" ;;
+    2) mode="psiphon" ;;
     0) return 0 ;;
     *) echo "[-] 无效选择"; return 0 ;;
   esac
 
-  # smart/psiphon 必须要有 psictl / Psiphon
+  # psiphon 模式必须要有 psictl / Psiphon
   if [[ "$mode" != "direct" ]] && ! have_cmd psictl; then
     echo ""
     echo "[-] 未检测到 psictl / Psiphon 组件。"
@@ -1977,14 +1848,14 @@ main(){
   prompt CERT_MODE "HY2/TUIC TLS证书模式：le(自动申请) 或 self(自签)" "$DEFAULT_CERT_MODE"
 
   # 出站模式选择
-  prompt EGRESS_MODE "出站模式: direct(直连) smart(AI/流媒体走Psiphon) psiphon(全走Psiphon)" "$DEFAULT_EGRESS_MODE"
+  prompt EGRESS_MODE "出站模式: direct(直连) psiphon(全走Psiphon)" "$DEFAULT_EGRESS_MODE"
   EGRESS_MODE="${EGRESS_MODE,,}"  # 转小写
-  if [[ ! "$EGRESS_MODE" =~ ^(direct|smart|psiphon)$ ]]; then
-    ylw "[!] 无效的出站模式，使用默认值: smart"
-    EGRESS_MODE="smart"
+  if [[ ! "$EGRESS_MODE" =~ ^(direct|psiphon)$ ]]; then
+    ylw "[!] 无效的出站模式，使用默认值: direct"
+    EGRESS_MODE="direct"
   fi
 
-  # 仅 smart/psiphon 模式需要 Psiphon 参数
+  # psiphon 模式需要 Psiphon 参数
   if [[ "$EGRESS_MODE" != "direct" ]]; then
     prompt PSIPHON_REGION "Psiphon 出站国家(两位代码，如 US/JP/SG/DE，AUTO=自动)" "$DEFAULT_PSIPHON_REGION"
     prompt PSIPHON_SOCKS "Psiphon 本地 SOCKS5 端口" "$DEFAULT_PSIPHON_SOCKS"
@@ -1999,7 +1870,7 @@ main(){
   ylw "[*] 请确保放行端口：${VLESS_PORT}/tcp, ${HY2_PORT}/udp, ${TUIC_PORT}/udp"
   ylw "[*] 出站模式: ${EGRESS_MODE}"
 
-  # 仅 smart/psiphon 模式安装 Psiphon
+  # psiphon 模式安装 Psiphon
   if [[ "$EGRESS_MODE" != "direct" ]]; then
     install_psiphon
   fi
@@ -2008,7 +1879,7 @@ main(){
   install_hysteria2
   install_tuic_server
 
-  # 仅 smart/psiphon 模式安装 psictl
+  # psiphon 模式安装 psictl
   if [[ "$EGRESS_MODE" != "direct" ]]; then
     install_psictl
   fi

@@ -642,8 +642,18 @@ install_tuic_server(){
   chmod +x /usr/local/bin/tuic-server
 
   local tuic_uuid tuic_pass
-  tuic_uuid="$(gen_uuid)"
-  tuic_pass="$(rand_hex 10)"
+
+  # 如果已有配置，优先复用，避免节点信息每次安装都变
+  if [[ -f /etc/tuic/config.json ]]; then
+    tuic_uuid="$(jq -r '.users | to_entries[0].key // empty' /etc/tuic/config.json 2>/dev/null || true)"
+    tuic_pass="$(jq -r '.users | to_entries[0].value // empty' /etc/tuic/config.json 2>/dev/null || true)"
+  fi
+
+  # 没取到再生成新的（首次安装）
+  if [[ -z "$tuic_uuid" || -z "$tuic_pass" ]]; then
+    tuic_uuid="$(gen_uuid)"
+    tuic_pass="$(rand_hex 10)"
+  fi
 
   mkdir -p /etc/tuic
 
@@ -660,7 +670,7 @@ install_tuic_server(){
   "udp_relay_ipv6": true,
   "zero_rtt_handshake": false,
   "auth_timeout": "10s",
-  "max_idle_time": "30s",
+  "max_idle_time": "60s",
   "max_external_packet_size": 1200,
   "gc_interval": "3s",
   "gc_lifetime": "15s",

@@ -614,19 +614,19 @@ install_tuic_server(){
   ylw "[*] 安装 tuic-server..."
   local url=""
   if [[ "$arch" == "amd64" ]]; then
-    url="$(download_latest_github_release_asset "EAimTY/tuic" "tuic-server.*x86_64.*linux" || true)"
+    url="$(download_latest_github_release_asset "tuic-protocol/tuic" "tuic-server-.*x86_64-unknown-linux-gnu$" || true)"
   elif [[ "$arch" == "arm64" ]]; then
-    url="$(download_latest_github_release_asset "EAimTY/tuic" "tuic-server.*aarch64.*linux" || true)"
+    url="$(download_latest_github_release_asset "tuic-protocol/tuic" "tuic-server-.*aarch64-unknown-linux-gnu$" || true)"
   fi
 
   if [[ -z "$url" ]]; then
     ylw "[!] 未能获取 tuic-server，尝试备用方式..."
-    local api="https://api.github.com/repos/EAimTY/tuic/releases"
+    local api="https://api.github.com/repos/tuic-protocol/tuic/releases"
     if command -v curl >/dev/null 2>&1; then
       if [[ "$arch" == "amd64" ]]; then
-        url="$(curl -fsSL "$api" | jq -r '.[0].assets[].browser_download_url' | grep -i "tuic-server.*x86_64.*linux" | head -n1 || true)"
+        url="$(curl -fsSL "$api" | jq -r '.[0].assets[].browser_download_url' | grep -E 'tuic-server-.*x86_64-unknown-linux-gnu$' | head -n1 || true)"
       elif [[ "$arch" == "arm64" ]]; then
-        url="$(curl -fsSL "$api" | jq -r '.[0].assets[].browser_download_url' | grep -i "tuic-server.*aarch64.*linux" | head -n1 || true)"
+        url="$(curl -fsSL "$api" | jq -r '.[0].assets[].browser_download_url' | grep -E 'tuic-server-.*aarch64-unknown-linux-gnu$' | head -n1 || true)"
       fi
     fi
   fi
@@ -657,10 +657,14 @@ install_tuic_server(){
   "private_key": "/etc/ssl/sbox/self.key",
   "congestion_control": "bbr",
   "alpn": ["h3"],
+  "udp_relay_ipv6": true,
   "zero_rtt_handshake": false,
-  "auth_timeout": "3s",
-  "max_idle_time": "10s",
-  "log_level": "info"
+  "auth_timeout": "10s",
+  "max_idle_time": "30s",
+  "max_external_packet_size": 1200,
+  "gc_interval": "3s",
+  "gc_lifetime": "15s",
+  "log_level": "warn"
 }
 EOF
 

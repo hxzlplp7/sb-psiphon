@@ -1067,12 +1067,13 @@ PSICTL_EOF
   grn "[+] psictl 已安装"
 }
 
-# ========= vpsmenu (统一入口版) =========
+# ========= vpsmenu (统一入口版 + whiptail 美化 + 内置 psi-setup) =========
 install_menu(){
-  ylw "[*] 安装菜单命令 vpsmenu (统一入口版)..."
+  ylw "[*] 安装菜单命令 vpsmenu (统一入口版 + whiptail 美化)..."
   
   # 统一菜单：无论 direct/smart/psiphon，都用同一份脚本
   # 运行时根据 psictl 是否存在来决定功能可用性
+  # 支持 whiptail 美化（没装就降级文本版）
   cat > /usr/local/bin/vpsmenu <<'MENU_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1080,56 +1081,83 @@ set -euo pipefail
 SERVICES_IN=("xray" "hysteria2" "tuic")
 SERVICE_PSI="psiphon"
 CLIENT_JSON="/etc/psiphon-egress/client.json"
+PSI_CFG="/etc/psiphon/psiphon.config"
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
+is_root() { [[ ${EUID:-$(id -u)} -eq 0 ]]; }
 
 pause() { read -r -p $'\n回车继续...' _; }
 
-print_box() {
+# ==================== whiptail 检测 ====================
+USE_WHIPTAIL=false
+if have_cmd whiptail; then
+  USE_WHIPTAIL=true
+fi
+
+# ==================== 文本版菜单 ====================
+show_text_menu() {
+  clear
+  local mode="unknown" psi_status="未安装"
+  [[ -f "$CLIENT_JSON" ]] && have_cmd jq && mode="$(jq -r '.egress_mode // "unknown"' "$CLIENT_JSON" 2>/dev/null || echo unknown)"
+  have_cmd psictl && psi_status="已安装"
+
   echo "╔══════════════════════════════════════════════════════╗"
   echo "║   多协议入站 + Psiphon 出站 管理菜单 (合并版)        ║"
-  echo "╚══════════════════════════════════════════════════════╝"
-}
-
-show_mode_hint() {
-  local mode="unknown"
-  if [[ -f "$CLIENT_JSON" ]] && have_cmd jq; then
-    mode="$(jq -r '.egress_mode // "unknown"' "$CLIENT_JSON" 2>/dev/null || echo unknown)"
-  fi
-  local psi="未安装"
-  have_cmd psictl && psi="已安装"
-  echo "当前检测：egress_mode=${mode} ｜ psictl=${psi}"
-}
-
-show_menu() {
-  clear
-  print_box
-  show_mode_hint
+  echo "╠══════════════════════════════════════════════════════╣"
+  echo "║  egress_mode=${mode} | psictl=${psi_status}"
   echo "╠══════════════════════════════════════════════════════╣"
   echo "║  入站(通用)                                          ║"
   echo "╠══════════════════════════════════════════════════════╣"
-  echo "║  1) 查看分享链接 (优先 psictl links)                 ║"
-  echo "║  2) 重启所有服务 (xray/hy2/tuic + 可选 psiphon)      ║"
+  echo "║  1) 查看分享链接                                     ║"
+  echo "║  2) 重启所有服务                                     ║"
   echo "║  3) 查看服务状态                                     ║"
-  echo "║  4) 查看日志 (选择服务)                              ║"
+  echo "║  4) 查看日志                                         ║"
   echo "╠══════════════════════════════════════════════════════╣"
   echo "║  Psiphon(赛风)                                       ║"
   echo "╠══════════════════════════════════════════════════════╣"
-  echo "║  5) Psiphon 状态 (psictl status)                     ║"
-  echo "║  6) 切换出口国家 (psictl country XX/AUTO)            ║"
-  echo "║  7) 测试当前出口 IP (psictl egress-test)             ║"
-  echo "║  8) 智能选出口 (psictl smart-country)                ║"
-  echo "║  9) Psiphon 日志 (psictl logs psi 或 journalctl)     ║"
+  echo "║  5) Psiphon 状态                                     ║"
+  echo "║  6) 切换出口国家                                     ║"
+  echo "║  7) 测试当前出口 IP                                  ║"
+  echo "║  8) 智能选出口                                       ║"
+  echo "║  9) Psiphon 日志                                     ║"
   echo "╠══════════════════════════════════════════════════════╣"
+  echo "║  A) 安装/更新 Psiphon 组件 (不动入站)                ║"
   echo "║  0) 退出                                             ║"
   echo "╚══════════════════════════════════════════════════════╝"
 }
 
+# ==================== whiptail 版菜单 ====================
+show_whiptail_menu() {
+  local mode="unknown" psi_status="未安装"
+  [[ -f "$CLIENT_JSON" ]] && have_cmd jq && mode="$(jq -r '.egress_mode // "unknown"' "$CLIENT_JSON" 2>/dev/null || echo unknown)"
+  have_cmd psictl && psi_status="已安装"
+
+  local title="多协议管理菜单 [模式:${mode}|psictl:${psi_status}]"
+  
+  local choice
+  choice=$(whiptail --title "$title" --menu "请选择操作" 22 60 14 \
+    "1" "查看分享链接" \
+    "2" "重启所有服务 (xray/hy2/tuic/psiphon)" \
+    "3" "查看服务状态" \
+    "4" "查看日志" \
+    "-" "──────── Psiphon ────────" \
+    "5" "Psiphon 状态" \
+    "6" "切换出口国家" \
+    "7" "测试当前出口 IP" \
+    "8" "智能选出口 (先测试后选择)" \
+    "9" "Psiphon 日志" \
+    "-" "────────────────────────" \
+    "A" "安装/更新 Psiphon 组件 (不动入站)" \
+    "0" "退出" 3>&1 1>&2 2>&3) || true
+  
+  echo "$choice"
+}
+
+# ==================== 功能函数 ====================
 view_links() {
   if have_cmd psictl; then
     psictl links
   else
-    # 无 psictl 时，直接从 client.json 读取
     if [[ ! -f "$CLIENT_JSON" ]]; then
       echo "[-] 未找到 $CLIENT_JSON，无法生成分享链接"
       echo "    请重新运行安装脚本"
@@ -1186,9 +1214,8 @@ restart_all() {
     echo "重启 Psiphon: ${SERVICE_PSI}"
     systemctl restart "${SERVICE_PSI}" 2>/dev/null || true
   else
-    echo "未发现 psiphon.service，跳过 Psiphon 重启。"
+    echo "未发现 psiphon.service，跳过。"
   fi
-
   echo "[+] 完成。"
 }
 
@@ -1205,7 +1232,7 @@ status_all() {
 }
 
 logs_menu() {
-  echo "可选：xray | hy2(hysteria2) | tuic | psi(psiphon) | all"
+  echo "可选：xray | hy2 | tuic | psi | all"
   read -r -p "选择(默认 all): " s
   s="${s:-all}"
   case "$s" in
@@ -1229,8 +1256,11 @@ logs_menu() {
 
 psi_guard() {
   if ! have_cmd psictl; then
-    echo "未检测到 psictl（通常=你现在是 direct 模式/没装 Psiphon 组件）。"
-    echo "要让 Psiphon 选项真正可用，需要先安装/启用 Psiphon 出站（脚本会提供 psictl）。"
+    echo ""
+    echo "╔══════════════════════════════════════════════════════╗"
+    echo "║  未检测到 psictl（Psiphon 组件未安装）               ║"
+    echo "║  请先选择 'A' 安装 Psiphon 组件                      ║"
+    echo "╚══════════════════════════════════════════════════════╝"
     return 1
   fi
   return 0
@@ -1248,21 +1278,243 @@ psi_country() {
 }
 
 psi_egress_test() { psi_guard || return 0; psictl egress-test; }
-
 psi_smart_country() { psi_guard || return 0; psictl smart-country; }
 
 psi_logs() {
   if have_cmd psictl; then
     psictl logs psi
   else
-    journalctl -u psiphon -n 200 --no-pager 2>/dev/null || echo "psiphon.service 不存在或未运行"
+    journalctl -u psiphon -n 200 --no-pager 2>/dev/null || echo "psiphon.service 不存在"
   fi
 }
 
+# ==================== 内置 psi-setup（只装 Psiphon 组件，不动入站）====================
+psi_setup() {
+  if ! is_root; then
+    echo "[-] 请用 root 运行"
+    return 1
+  fi
+
+  echo ""
+  echo "╔══════════════════════════════════════════════════════╗"
+  echo "║  安装/更新 Psiphon 组件 (不动入站配置)               ║"
+  echo "╚══════════════════════════════════════════════════════╝"
+  echo ""
+
+  # 安装依赖
+  if have_cmd apt-get; then
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y curl wget jq unzip ca-certificates >/dev/null 2>&1 || true
+  elif have_cmd dnf; then
+    dnf -y install curl wget jq unzip ca-certificates >/dev/null 2>&1 || true
+  elif have_cmd yum; then
+    yum -y install curl wget jq unzip ca-certificates >/dev/null 2>&1 || true
+  fi
+
+  # 检测平台
+  local os arch
+  os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+  case "$os" in linux) os="linux";; freebsd) os="freebsd";; *) echo "不支持的 OS: $os"; return 1;; esac
+  
+  arch="$(uname -m | tr '[:upper:]' '[:lower:]')"
+  case "$arch" in x86_64|amd64) arch="amd64";; aarch64|arm64) arch="arm64";; armv7l|armv7|armv6l) arch="armv7";; i386|i686) arch="386";; *) echo "不支持的架构: $arch"; return 1;; esac
+
+  echo "[*] 平台: ${os}/${arch}"
+
+  # 读取已有配置或使用默认值
+  local REGION="US" SOCKS="1081" HTTP="8081"
+  if [[ -f "$PSI_CFG" ]] && have_cmd jq; then
+    REGION="$(jq -r '.EgressRegion // "US"' "$PSI_CFG" 2>/dev/null || echo "US")"
+    [[ -z "$REGION" ]] && REGION="US"
+    SOCKS="$(jq -r '.LocalSocksProxyPort // 1081' "$PSI_CFG" 2>/dev/null || echo "1081")"
+    HTTP="$(jq -r '.LocalHttpProxyPort // 8081' "$PSI_CFG" 2>/dev/null || echo "8081")"
+  fi
+
+  read -r -p "Psiphon 出口国家 (如 US/JP/SG，AUTO=自动) [${REGION}]: " r || true
+  REGION="${r:-$REGION}"
+  [[ "${REGION^^}" == "AUTO" ]] && REGION=""
+  
+  read -r -p "Psiphon SOCKS5 端口 [${SOCKS}]: " s || true
+  SOCKS="${s:-$SOCKS}"
+  
+  read -r -p "Psiphon HTTP 端口 [${HTTP}]: " h || true
+  HTTP="${h:-$HTTP}"
+
+  mkdir -p /etc/psiphon /var/lib/psiphon /usr/local/bin
+
+  # 下载 psiphon-tunnel-core
+  local TAG="v1.0.0" OWNER="hxzlplp7" REPO="psiphon-tunnel-core"
+  local ASSET="psiphon-tunnel-core-${os}-${arch}.tar.gz"
+  local URL="https://github.com/${OWNER}/${REPO}/releases/download/${TAG}/${ASSET}"
+  local FALLBACK="https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core-binaries/master/linux/psiphon-tunnel-core-x86_64"
+
+  local tmpd
+  tmpd="$(mktemp -d)"
+  trap "rm -rf '$tmpd'" RETURN
+
+  local success=false
+  if curl -fsI "$URL" >/dev/null 2>&1; then
+    echo "[*] 下载: $URL"
+    curl -fsSL "$URL" -o "$tmpd/$ASSET"
+    tar -xzf "$tmpd/$ASSET" -C "$tmpd"
+    local BIN
+    BIN="$(find "$tmpd" -maxdepth 2 -type f -name 'psiphon-tunnel-core*' ! -name '*.tar.gz' | head -n1)"
+    if [[ -n "$BIN" && -f "$BIN" ]]; then
+      install -m 0755 "$BIN" /usr/local/bin/psiphon-tunnel-core
+      success=true
+    fi
+  fi
+
+  if [[ "$success" != "true" && "$os" == "linux" && "$arch" == "amd64" ]]; then
+    echo "[*] Fallback 到官方二进制..."
+    curl -fsSL "$FALLBACK" -o "$tmpd/psiphon-tunnel-core"
+    install -m 0755 "$tmpd/psiphon-tunnel-core" /usr/local/bin/psiphon-tunnel-core
+    success=true
+  fi
+
+  if [[ "$success" != "true" ]]; then
+    echo "[-] 无法获取 Psiphon 二进制: ${os}/${arch}"
+    return 1
+  fi
+
+  echo "[+] psiphon-tunnel-core 已安装"
+
+  # 写配置
+  cat >/etc/psiphon/psiphon.config <<JSON
+{
+  "LocalHttpProxyPort": ${HTTP},
+  "LocalSocksProxyPort": ${SOCKS},
+  "EgressRegion": "${REGION}",
+  "PropagationChannelId": "FFFFFFFFFFFFFFFF",
+  "SponsorId": "FFFFFFFFFFFFFFFF",
+  "RemoteServerListDownloadFilename": "/var/lib/psiphon/remote_server_list",
+  "RemoteServerListSignaturePublicKey": "MIICIDANBgkqhkiG9w0BAQEFAAOCAg0AMIICCAKCAgEAt7Ls+/39r+T6zNW7GiVpJfzq/xvL9SBH5rIFnk0RXYEYavax3WS6HOD35eTAqn8AniOwiH+DOkvgSKF2caqk/y1dfq47Pdymtwzp9ikpB1C5OfAysXzBiwVJlCdajBKvBZDerV1cMvRzCKvKwRmvDmHgphQQ7WfXIGbRbmmk6opMBh3roE42KcotLFtqp0RRwLtcBRNtCdsrVsjiI1Lqz/lH+T61sGjSjQ3CHMuZYSQJZo/KrvzgQXpkaCTdbObxHqb6/+i1qaVOfEsvjoiyzTxJADvSytVtcTjijhPEV6XskJVHE1Zgl+7rATr/pDQkw6DPCNBS1+Y6fy7GstZALQXwEDN/qhQI9kWkHijT8ns+i1vGg00Mk/6J75arLhqcodWsdeG/M/moWgqQAnlZAGVtJI1OgeF5fsPpXu4kctOfuZlGjVZXQNW34aOzm8r8S0eVZitPlbhcPiR4gT/aSMz/wd8lZlzZYsje/Jr8u/YtlwjjreZrGRmG8KMOzukV3lLmMppXFMvl4bxv6YFEmIuTsOhbLTwFgh7KYNjodLj/LsqRVfwz31PgWQFTEPICV7GCvgVlPRxnofqKSjgTWI4mxDhBpVcATvaoBl1L/6WLbFvBsoAUBItWwctO2xalKxF5szhGm8lccoc5MZr8kfE0uxMgsxz4er68iCID+rsCAQM=",
+  "RemoteServerListUrl": "https://s3.amazonaws.com//psiphon/web/mjr4-p23r-puwl/server_list_compressed",
+  "UseIndistinguishableTLS": true
+}
+JSON
+
+  # systemd 服务
+  cat >/etc/systemd/system/psiphon.service <<'UNIT'
+[Unit]
+Description=Psiphon Tunnel Core (ConsoleClient)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/lib/psiphon
+ExecStart=/usr/local/bin/psiphon-tunnel-core -config /etc/psiphon/psiphon.config
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  systemctl daemon-reload
+  systemctl enable --now psiphon
+
+  # 安装精简版 psictl（如果不存在或版本较旧）
+  if ! have_cmd psictl || [[ "$(psictl 2>&1 | grep -c 'smart-country')" -eq 0 ]]; then
+    echo "[*] 安装 psictl..."
+    cat >/usr/local/bin/psictl <<'PSICTL'
+#!/usr/bin/env bash
+set -euo pipefail
+CFG="/etc/psiphon/psiphon.config"
+SOCKS_PORT="$(jq -r '.LocalSocksProxyPort' "$CFG" 2>/dev/null || echo "1081")"
+REGION="$(jq -r '.EgressRegion // ""' "$CFG" 2>/dev/null || echo "")"
+
+case "${1:-}" in
+  status)
+    echo "EgressRegion: ${REGION:-AUTO}"
+    echo "SOCKS: 127.0.0.1:${SOCKS_PORT}"
+    systemctl --no-pager -l status psiphon 2>/dev/null || true
+    ;;
+  country)
+    [[ -n "${2:-}" ]] || { echo "用法: psictl country <CC|AUTO>"; exit 1; }
+    tmp="$(mktemp)"
+    if [[ "${2^^}" == "AUTO" ]]; then jq '.EgressRegion=""' "$CFG" >"$tmp"; else jq --arg cc "${2^^}" '.EgressRegion=$cc' "$CFG" >"$tmp"; fi
+    mv "$tmp" "$CFG"
+    systemctl restart psiphon
+    sleep 3
+    echo "[+] 已切换为: ${2^^}"
+    ;;
+  egress-test)
+    curl -fsS --max-time 12 --socks5-hostname "127.0.0.1:${SOCKS_PORT}" https://ipinfo.io/json | jq -r '"IP: \(.ip)\nCountry: \(.country)\nOrg: \(.org)\nCity: \(.city)"'
+    ;;
+  logs)
+    case "${2:-}" in
+      psi|psiphon) journalctl -u psiphon -n 200 --no-pager ;;
+      xray) journalctl -u xray -n 200 --no-pager ;;
+      hy2|hysteria) journalctl -u hysteria2 -n 200 --no-pager ;;
+      tuic) journalctl -u tuic -n 200 --no-pager ;;
+      *) journalctl -u psiphon -u xray -u hysteria2 -u tuic -n 200 --no-pager ;;
+    esac
+    ;;
+  links)
+    f="/etc/psiphon-egress/client.json"
+    [[ -f "$f" ]] || { echo "[-] 未找到 $f"; exit 1; }
+    host="$(jq -r '.host' "$f")"
+    cert_mode="$(jq -r '.cert_mode' "$f")"
+    insecure=0; [[ "$cert_mode" == "self" ]] && insecure=1
+    echo ""
+    echo "==================== 分享链接 ===================="
+    v_port="$(jq -r '.vless.port' "$f")"; v_uuid="$(jq -r '.vless.uuid' "$f")"; v_sni="$(jq -r '.vless.sni' "$f")"; v_pbk="$(jq -r '.vless.pbk' "$f")"; v_sid="$(jq -r '.vless.sid' "$f")"
+    echo "[VLESS+REALITY]"
+    echo "vless://${v_uuid}@${host}:${v_port}?encryption=none&security=reality&sni=${v_sni}&fp=chrome&pbk=${v_pbk}&sid=${v_sid}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
+    h_port="$(jq -r '.hy2.port' "$f")"; h_auth="$(jq -r '.hy2.auth' "$f")"; h_obfs="$(jq -r '.hy2.obfs_password' "$f")"; h_sni="$(jq -r '.hy2.sni // "www.bing.com"' "$f")"
+    echo "[Hysteria2]"
+    echo "hysteria2://${h_auth}@${host}:${h_port}/?obfs=salamander&obfs-password=${h_obfs}&sni=${h_sni}&insecure=${insecure}&alpn=h3#HY2"
+    t_uuid="$(jq -r '.tuic.uuid // empty' "$f")"
+    if [[ -n "$t_uuid" && "$t_uuid" != "null" ]]; then
+      t_port="$(jq -r '.tuic.port' "$f")"; t_pass="$(jq -r '.tuic.password' "$f")"; t_sni="$(jq -r '.tuic.sni // "www.bing.com"' "$f")"
+      echo "[TUIC v5]"
+      echo "tuic://${t_uuid}:${t_pass}@${host}:${t_port}?alpn=h3&udp_relay_mode=native&congestion_control=bbr&sni=${t_sni}&allow_insecure=${insecure}#TUIC-v5"
+    fi
+    echo "=================================================="
+    ;;
+  smart-country)
+    echo "[智能切换] 选择国家..."
+    PS3="请选择编号: "
+    select cc in US JP SG DE FR GB NL AT BE CA CH AUTO 取消; do
+      case "$cc" in
+        取消) break ;;
+        AUTO) psictl country AUTO; psictl egress-test || true; break ;;
+        *) [[ -n "$cc" ]] && { psictl country "$cc"; psictl egress-test || true; break; } ;;
+      esac
+    done
+    ;;
+  *)
+    echo "psictl status | country <CC|AUTO> | egress-test | links | logs [svc] | smart-country"
+    ;;
+esac
+PSICTL
+    chmod +x /usr/local/bin/psictl
+    echo "[+] psictl 已安装"
+  fi
+
+  echo ""
+  echo "[+] Psiphon 组件安装完成！"
+  echo "    SOCKS: 127.0.0.1:${SOCKS}"
+  echo "    HTTP:  127.0.0.1:${HTTP}"
+  echo "    国家:  ${REGION:-AUTO}"
+  echo ""
+  echo "现在可以使用 Psiphon 相关菜单选项了。"
+}
+
+# ==================== 主循环 ====================
 main() {
   while true; do
-    show_menu
-    read -r -p "请选择 [0-9]: " choice
+    local choice
+    if $USE_WHIPTAIL; then
+      choice="$(show_whiptail_menu)"
+    else
+      show_text_menu
+      read -r -p "请选择 [0-9/A]: " choice || true
+    fi
+
     case "${choice:-}" in
       1) view_links; pause ;;
       2) restart_all; pause ;;
@@ -1273,8 +1525,10 @@ main() {
       7) psi_egress_test; pause ;;
       8) psi_smart_country; pause ;;
       9) psi_logs; pause ;;
+      [Aa]) psi_setup; pause ;;
       0) exit 0 ;;
-      *) echo "无效输入"; pause ;;
+      "-") ;; # whiptail 分隔符，忽略
+      *) [[ -n "${choice:-}" ]] && echo "无效输入: $choice" && pause ;;
     esac
   done
 }

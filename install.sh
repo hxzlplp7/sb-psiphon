@@ -641,7 +641,7 @@ install_tuic_server(){
   download_file "$url" /usr/local/bin/tuic-server
   chmod +x /usr/local/bin/tuic-server
 
-  local tuic_uuid tuic_pass
+  local tuic_uuid="" tuic_pass=""
 
   # 如果已有配置，优先复用，避免节点信息每次安装都变
   if [[ -f /etc/tuic/config.json ]]; then
@@ -650,7 +650,7 @@ install_tuic_server(){
   fi
 
   # 没取到再生成新的（首次安装）
-  if [[ -z "$tuic_uuid" || -z "$tuic_pass" ]]; then
+  if [[ -z "${tuic_uuid:-}" || -z "${tuic_pass:-}" ]]; then
     tuic_uuid="$(gen_uuid)"
     tuic_pass="$(rand_hex 10)"
   fi

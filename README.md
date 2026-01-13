@@ -9,9 +9,17 @@
   - **Hysteria2**（apernet/hysteria）
   - **TUIC v5**（EAimTY/tuic）
 
-- **出站链路**：
-  - **Psiphon 官方 ConsoleClient**（tunnel-core）
-  - 提供本地 SOCKS5/HTTP 代理，支持 `EgressRegion` 切换出口国家
+- **出站模式**（三选一）：
+  | 模式 | 说明 |
+  |------|------|
+  | `direct` | 所有流量直连（不安装 Psiphon） |
+  | `smart` | **推荐**：AI/流媒体→Psiphon，其余直连 |
+  | `psiphon` | 所有流量走 Psiphon 出站 |
+
+- **smart 模式分流规则**：
+  - 走 Psiphon：Google、YouTube、Twitter/X、Netflix、TikTok、Bing
+  - 走 Psiphon：OpenAI、Anthropic、Perplexity、HuggingFace、Gemini、DeepSeek、Groq、ElevenLabs
+  - 其余全部直连
 
 - **管理功能**：
   - 国家选择（支持 28+ 个国家）
@@ -30,21 +38,20 @@
 │  ┌─────────────────────────────────────────────────────┐   │
 │  │  Xray (VLESS+Reality)  :443 TCP                     │   │
 │  │  Hysteria2             :8443 UDP                    │   │
-│  │  TUIC                  :2053 UDP                    │   │
+│  │  TUIC                  :2053 UDP (固定直连)          │   │
 │  │                                                      │   │
-│  │  ↓ 所有协议出站统一指向 ↓                           │   │
+│  │  ↓ smart 模式：AI/流媒体→Psiphon，其余→直连 ↓       │   │
 │  └─────────────────────────┬───────────────────────────┘   │
 │                            │                                │
 │  ┌─────────────────────────▼───────────────────────────┐   │
-│  │      Psiphon ConsoleClient (官方)                   │   │
+│  │      Psiphon ConsoleClient (smart/psiphon 模式)     │   │
 │  │      SOCKS5 127.0.0.1:1081                          │   │
-│  │      HTTP   127.0.0.1:8081                          │   │
 │  │      EgressRegion: US/JP/SG/DE/...                  │   │
 │  └─────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
                            │
                            ▼
-                    目标网站 (落地IP: Psiphon 节点)
+                    目标网站 (落地IP: 直连=VPS IP / Psiphon=出口国家IP)
 ```
 
 ## 适用系统

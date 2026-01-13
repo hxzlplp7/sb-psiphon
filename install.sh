@@ -12,6 +12,7 @@ DEFAULT_CERT_MODE="self"   # self | le
 DEFAULT_PSIPHON_REGION="US"
 DEFAULT_PSIPHON_SOCKS="1081"
 DEFAULT_PSIPHON_HTTP="8081"
+DEFAULT_EGRESS_MODE="smart"   # direct | smart | psiphon
 
 # ========= 全局临时目录管理（防止 set -u 报 unbound variable）=========
 _tmpd=""
@@ -374,6 +375,82 @@ install_xray_vless_reality(){
   grn "    PublicKey:  ${pub:0:10}..."
 
   mkdir -p /etc/xray
+
+  # 根据出站模式生成不同的 outbounds 和 routing
+  local xray_outbounds xray_routing xray_sniffing
+  
+  case "$EGRESS_MODE" in
+    direct)
+      # 直连模式：所有流量直连
+      xray_outbounds='
+    { "protocol": "freedom", "tag": "direct", "settings": {} }
+  '
+      xray_routing='"domainStrategy": "AsIs",
+    "rules": [
+      { "type": "field", "outboundTag": "direct", "network": "tcp,udp" }
+    ]'
+      xray_sniffing='"sniffing": { "enabled": true, "destOverride": ["http","tls"] }'
+      ;;
+    smart)
+      # 智能分流：AI/流媒体→psiphon，其余→direct
+      xray_outbounds='
+    { "protocol": "freedom", "tag": "direct", "settings": {} },
+    {
+      "protocol": "socks",
+      "tag": "psiphon",
+      "settings": { "servers": [{ "address": "127.0.0.1", "port": '"${PSIPHON_SOCKS}"' }] }
+    }
+  '
+      xray_routing='"domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {
+        "type": "field",
+        "outboundTag": "psiphon",
+        "domain": [
+          "geosite:google",
+          "geosite:youtube",
+          "geosite:twitter",
+          "domain:x.com",
+          "geosite:netflix",
+          "geosite:tiktok",
+          "geosite:bing",
+          "geosite:openai",
+          "geosite:anthropic",
+          "geosite:perplexity",
+          "geosite:huggingface",
+          "geosite:google-gemini",
+          "geosite:google-deepmind",
+          "geosite:deepseek",
+          "geosite:groq",
+          "geosite:elevenlabs"
+        ]
+      },
+      { "type": "field", "network": "tcp,udp", "outboundTag": "direct" }
+    ]'
+      # smart 模式开启增强 sniffing 以支持域名分流
+      xray_sniffing='"sniffing": { "enabled": true, "destOverride": ["http","tls","quic"], "routeOnly": true }'
+      ;;
+    psiphon)
+      # 全走 Psiphon
+      xray_outbounds='
+    {
+      "protocol": "socks",
+      "tag": "psiphon",
+      "settings": {
+        "servers": [
+          { "address": "127.0.0.1", "port": '"${PSIPHON_SOCKS}"' }
+        ]
+      }
+    }
+  '
+      xray_routing='"domainStrategy": "AsIs",
+    "rules": [
+      { "type": "field", "outboundTag": "psiphon", "network": "tcp,udp" }
+    ]'
+      xray_sniffing='"sniffing": { "enabled": true, "destOverride": ["http","tls"] }'
+      ;;
+  esac
+
   cat > /etc/xray/config.json <<EOF
 {
   "log": { "loglevel": "warning" },
@@ -398,34 +475,31 @@ install_xray_vless_reality(){
           "shortIds": ["${sid}"]
         }
       },
-      "sniffing": { "enabled": true, "destOverride": ["http","tls"] }
+      ${xray_sniffing}
     }
   ],
-  "outbounds": [
-    {
-      "protocol": "socks",
-      "tag": "psiphon",
-      "settings": {
-        "servers": [
-          { "address": "127.0.0.1", "port": ${PSIPHON_SOCKS} }
-        ]
-      }
-    }
-  ],
+  "outbounds": [${xray_outbounds}],
   "routing": {
-    "domainStrategy": "AsIs",
-    "rules": [
-      { "type": "field", "outboundTag": "psiphon", "network": "tcp,udp" }
-    ]
+    ${xray_routing}
   }
 }
 EOF
 
-  cat > /etc/systemd/system/xray.service <<'EOF'
+  # systemd unit: 仅 smart/psiphon 模式依赖 psiphon.service
+  local unit_after unit_wants
+  if [[ "$EGRESS_MODE" != "direct" ]]; then
+    unit_after="After=network-online.target psiphon.service"
+    unit_wants="Wants=network-online.target psiphon.service"
+  else
+    unit_after="After=network-online.target"
+    unit_wants="Wants=network-online.target"
+  fi
+
+  cat > /etc/systemd/system/xray.service <<EOF
 [Unit]
 Description=Xray-core (VLESS+REALITY) Server
-After=network-online.target psiphon.service
-Wants=network-online.target psiphon.service
+${unit_after}
+${unit_wants}
 
 [Service]
 Type=simple
@@ -479,6 +553,7 @@ install_hysteria2(){
   fi
 
   if [[ "$CERT_MODE" == "le" ]]; then
+    # Let's Encrypt 模式 - 基础配置
     cat > /etc/hysteria/config.yaml <<EOF
 listen: :${HY2_PORT}
 acme:
@@ -494,13 +569,9 @@ obfs:
   type: salamander
   salamander:
     password: ${obfs_pass}
-outbounds:
-  - name: psiphon
-    type: socks5
-    socks5:
-      addr: 127.0.0.1:${PSIPHON_SOCKS}
 EOF
   else
+    # 自签证书模式 - 基础配置
     cat > /etc/hysteria/config.yaml <<EOF
 listen: :${HY2_PORT}
 tls:
@@ -514,19 +585,80 @@ obfs:
   type: salamander
   salamander:
     password: ${obfs_pass}
+EOF
+  fi
+
+  # 根据出站模式追加 outbounds 和 ACL 配置
+  case "$EGRESS_MODE" in
+    direct)
+      # 直连模式：不添加 outbounds（Hysteria2 默认直连）
+      ;;
+    smart)
+      # 智能分流：ACL 规则
+      cat >> /etc/hysteria/config.yaml <<EOF
+
+outbounds:
+  - name: direct
+    type: direct
+  - name: psiphon
+    type: socks5
+    socks5:
+      addr: 127.0.0.1:${PSIPHON_SOCKS}
+
+acl:
+  inline:
+    # Google / YouTube
+    - psiphon(geosite:google)
+    - psiphon(geosite:youtube)
+    # X/Twitter
+    - psiphon(geosite:twitter)
+    - psiphon(suffix:x.com)
+    # Netflix / TikTok / Bing
+    - psiphon(geosite:netflix)
+    - psiphon(geosite:tiktok)
+    - psiphon(geosite:bing)
+    # 常见 AI
+    - psiphon(geosite:openai)
+    - psiphon(geosite:anthropic)
+    - psiphon(geosite:perplexity)
+    - psiphon(geosite:huggingface)
+    - psiphon(geosite:google-gemini)
+    - psiphon(geosite:google-deepmind)
+    - psiphon(geosite:deepseek)
+    - psiphon(geosite:groq)
+    - psiphon(geosite:elevenlabs)
+    # 兜底：其他全直连
+    - direct(all)
+EOF
+      ;;
+    psiphon)
+      # 全走 Psiphon
+      cat >> /etc/hysteria/config.yaml <<EOF
+
 outbounds:
   - name: psiphon
     type: socks5
     socks5:
       addr: 127.0.0.1:${PSIPHON_SOCKS}
 EOF
+      ;;
+  esac
+
+  # systemd unit: 仅 smart/psiphon 模式依赖 psiphon.service
+  local unit_after unit_wants
+  if [[ "$EGRESS_MODE" != "direct" ]]; then
+    unit_after="After=network-online.target psiphon.service"
+    unit_wants="Wants=network-online.target psiphon.service"
+  else
+    unit_after="After=network-online.target"
+    unit_wants="Wants=network-online.target"
   fi
 
-  cat > /etc/systemd/system/hysteria2.service <<'EOF'
+  cat > /etc/systemd/system/hysteria2.service <<EOF
 [Unit]
 Description=Hysteria2 Server
-After=network-online.target psiphon.service
-Wants=network-online.target psiphon.service
+${unit_after}
+${unit_wants}
 
 [Service]
 Type=simple
@@ -605,11 +737,12 @@ install_tuic_server(){
 }
 EOF
 
+  # TUIC 固定直连（不支持服务端分流），不依赖 psiphon.service
   cat > /etc/systemd/system/tuic.service <<'EOF'
 [Unit]
 Description=tuic-server
-After=network-online.target psiphon.service
-Wants=network-online.target psiphon.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -937,7 +1070,97 @@ PSICTL_EOF
 # ========= vpsmenu =========
 install_menu(){
   ylw "[*] 安装菜单命令 vpsmenu..."
-  cat > /usr/local/bin/vpsmenu <<'MENU_EOF'
+  
+  if [[ "$EGRESS_MODE" == "direct" ]]; then
+    # 直连模式：简化版菜单（无 Psiphon 管理）
+    cat > /usr/local/bin/vpsmenu <<'MENU_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+CLIENT_JSON="/etc/psiphon-egress/client.json"
+
+show_links() {
+  if [[ ! -f "$CLIENT_JSON" ]]; then
+    echo "[-] 未找到 $CLIENT_JSON"
+    return 1
+  fi
+  local host cert_mode
+  host="$(jq -r '.host' "$CLIENT_JSON")"
+  cert_mode="$(jq -r '.cert_mode' "$CLIENT_JSON")"
+  local insecure=0; [[ "$cert_mode" == "self" ]] && insecure=1
+
+  local v_port v_uuid v_sni v_pbk v_sid
+  v_port="$(jq -r '.vless.port' "$CLIENT_JSON")"
+  v_uuid="$(jq -r '.vless.uuid' "$CLIENT_JSON")"
+  v_sni="$(jq -r '.vless.sni' "$CLIENT_JSON")"
+  v_pbk="$(jq -r '.vless.pbk' "$CLIENT_JSON")"
+  v_sid="$(jq -r '.vless.sid' "$CLIENT_JSON")"
+
+  local h_port h_auth h_obfs h_sni
+  h_port="$(jq -r '.hy2.port' "$CLIENT_JSON")"
+  h_auth="$(jq -r '.hy2.auth' "$CLIENT_JSON")"
+  h_obfs="$(jq -r '.hy2.obfs_password' "$CLIENT_JSON")"
+  h_sni="$(jq -r '.hy2.sni // "www.bing.com"' "$CLIENT_JSON")"
+
+  local t_port t_uuid t_pass t_sni
+  t_port="$(jq -r '.tuic.port // empty' "$CLIENT_JSON")"
+  t_uuid="$(jq -r '.tuic.uuid // empty' "$CLIENT_JSON")"
+  t_pass="$(jq -r '.tuic.password // empty' "$CLIENT_JSON")"
+  t_sni="$(jq -r '.tuic.sni // "www.bing.com"' "$CLIENT_JSON")"
+
+  echo ""
+  echo "==================== 分享链接 ===================="
+  echo ""
+  echo "[VLESS+REALITY]"
+  echo "vless://${v_uuid}@${host}:${v_port}?encryption=none&security=reality&sni=${v_sni}&fp=chrome&pbk=${v_pbk}&sid=${v_sid}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
+  echo ""
+  echo "[Hysteria2]"
+  echo "hysteria2://${h_auth}@${host}:${h_port}/?obfs=salamander&obfs-password=${h_obfs}&sni=${h_sni}&insecure=${insecure}&alpn=h3#HY2"
+  if [[ -n "$t_uuid" && "$t_uuid" != "null" ]]; then
+    echo ""
+    echo "[TUIC v5]"
+    echo "tuic://${t_uuid}:${t_pass}@${host}:${t_port}?alpn=h3&udp_relay_mode=native&congestion_control=bbr&sni=${t_sni}&allow_insecure=${insecure}#TUIC-v5"
+  fi
+  echo ""
+  echo "=================================================="
+}
+
+while true; do
+  clear
+  cat <<MENU
+╔══════════════════════════════════════════════════════╗
+║   多协议入站 管理菜单 (直连模式)                      ║
+╠══════════════════════════════════════════════════════╣
+║  1) 查看分享链接                                     ║
+║  2) 重启所有服务                                     ║
+║  3) 查看服务状态                                     ║
+║  4) 查看日志                                         ║
+║  0) 退出                                             ║
+╚══════════════════════════════════════════════════════╝
+MENU
+  read -r -p "请选择 [0-4]: " c || true
+  case "$c" in
+    1) show_links; read -r -p "回车继续..." _ ;;
+    2) systemctl restart xray hysteria2 tuic 2>/dev/null || true; echo "[+] 已重启"; read -r -p "回车继续..." _ ;;
+    3) systemctl --no-pager status xray hysteria2 tuic 2>/dev/null || true; read -r -p "回车继续..." _ ;;
+    4)
+      echo "xray, hy2=hysteria2, tuic"
+      read -r -p "选择(默认全部): " t
+      case "${t:-all}" in
+        xray) journalctl -u xray -n 100 --no-pager ;;
+        hy2|hysteria) journalctl -u hysteria2 -n 100 --no-pager ;;
+        tuic) journalctl -u tuic -n 100 --no-pager ;;
+        *) journalctl -u xray -u hysteria2 -u tuic -n 100 --no-pager ;;
+      esac
+      read -r -p "回车继续..." _
+      ;;
+    0) exit 0 ;;
+  esac
+done
+MENU_EOF
+  else
+    # smart/psiphon 模式：完整版菜单（含 Psiphon 管理）
+    cat > /usr/local/bin/vpsmenu <<'MENU_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -992,6 +1215,7 @@ MENU
   esac
 done
 MENU_EOF
+  fi
   chmod +x /usr/local/bin/vpsmenu
   grn "[+] vpsmenu 已安装：运行 vpsmenu 打开菜单"
 }
@@ -1007,6 +1231,7 @@ save_client_json(){
 {
   "host": "${HOST}",
   "cert_mode": "${CERT_MODE}",
+  "egress_mode": "${EGRESS_MODE}",
   "vless": {
     "port": ${VLESS_PORT},
     "uuid": "${XRAY_UUID}",
@@ -1107,6 +1332,19 @@ EOF
   cat <<EOF
 ===============================================================
 
+出站模式: ${EGRESS_MODE}
+EOF
+
+  if [[ "$EGRESS_MODE" == "direct" ]]; then
+    cat <<EOF
+
+管理命令：
+  vpsmenu                  # 交互式菜单
+
+EOF
+  else
+    cat <<EOF
+
 管理命令：
   vpsmenu                  # 交互式菜单
   psictl links             # 查看分享链接
@@ -1116,6 +1354,7 @@ EOF
   psictl country-test-all  # 测试所有常用国家
 
 EOF
+  fi
 }
 
 # ========= main =========
@@ -1149,18 +1388,43 @@ main(){
   prompt REALITY_SNI "REALITY 伪装站点(需TLS1.3/H2，示例 www.apple.com)" "$DEFAULT_REALITY_SNI"
   prompt QUIC_SNI "HY2/TUIC 伪装站点SNI" "$DEFAULT_QUIC_SNI"
   prompt CERT_MODE "HY2/TUIC TLS证书模式：le(自动申请) 或 self(自签)" "$DEFAULT_CERT_MODE"
-  prompt PSIPHON_REGION "Psiphon 出站国家(两位代码，如 US/JP/SG/DE，AUTO=自动)" "$DEFAULT_PSIPHON_REGION"
-  prompt PSIPHON_SOCKS "Psiphon 本地 SOCKS5 端口" "$DEFAULT_PSIPHON_SOCKS"
-  prompt PSIPHON_HTTP "Psiphon 本地 HTTP 代理端口" "$DEFAULT_PSIPHON_HTTP"
+
+  # 出站模式选择
+  prompt EGRESS_MODE "出站模式: direct(直连) smart(AI/流媒体走Psiphon) psiphon(全走Psiphon)" "$DEFAULT_EGRESS_MODE"
+  EGRESS_MODE="${EGRESS_MODE,,}"  # 转小写
+  if [[ ! "$EGRESS_MODE" =~ ^(direct|smart|psiphon)$ ]]; then
+    ylw "[!] 无效的出站模式，使用默认值: smart"
+    EGRESS_MODE="smart"
+  fi
+
+  # 仅 smart/psiphon 模式需要 Psiphon 参数
+  if [[ "$EGRESS_MODE" != "direct" ]]; then
+    prompt PSIPHON_REGION "Psiphon 出站国家(两位代码，如 US/JP/SG/DE，AUTO=自动)" "$DEFAULT_PSIPHON_REGION"
+    prompt PSIPHON_SOCKS "Psiphon 本地 SOCKS5 端口" "$DEFAULT_PSIPHON_SOCKS"
+    prompt PSIPHON_HTTP "Psiphon 本地 HTTP 代理端口" "$DEFAULT_PSIPHON_HTTP"
+  else
+    # direct 模式不需要 Psiphon，设置默认值避免 unbound variable
+    PSIPHON_REGION=""
+    PSIPHON_SOCKS="1081"
+    PSIPHON_HTTP="8081"
+  fi
 
   ylw "[*] 请确保放行端口：${VLESS_PORT}/tcp, ${HY2_PORT}/udp, ${TUIC_PORT}/udp"
+  ylw "[*] 出站模式: ${EGRESS_MODE}"
 
-  install_psiphon
+  # 仅 smart/psiphon 模式安装 Psiphon
+  if [[ "$EGRESS_MODE" != "direct" ]]; then
+    install_psiphon
+  fi
+
   install_xray_vless_reality
   install_hysteria2
   install_tuic_server
 
-  install_psictl
+  # 仅 smart/psiphon 模式安装 psictl
+  if [[ "$EGRESS_MODE" != "direct" ]]; then
+    install_psictl
+  fi
   install_menu
 
   print_client_info

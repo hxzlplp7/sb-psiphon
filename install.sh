@@ -107,6 +107,12 @@ install_deps(){
     systemctl enable --now crond >/dev/null 2>&1 || true
   fi
   grn "[+] 依赖安装完成"
+
+  # 配置 IPv4 优先出站（避免 IPv6 导致的连接问题）
+  if ! grep -q 'precedence ::ffff:0:0/96' /etc/gai.conf 2>/dev/null; then
+    echo 'precedence ::ffff:0:0/96  100' >> /etc/gai.conf
+    ylw "[*] 已配置 IPv4 优先出站"
+  fi
 }
 
 prompt(){

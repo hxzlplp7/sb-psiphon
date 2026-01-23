@@ -12,7 +12,7 @@ DEFAULT_CERT_MODE="self"   # self | le
 DEFAULT_PSIPHON_REGION="US"
 DEFAULT_PSIPHON_SOCKS="1081"
 DEFAULT_PSIPHON_HTTP="8081"
-DEFAULT_EGRESS_MODE="direct"   # direct | psiphon
+DEFAULT_EGRESS_MODE="direct"   # direct | psiphon | freeproxy
 
 # ========= 全局临时目录管理（防止 set -u 报 unbound variable）=========
 _tmpd=""
@@ -1014,7 +1014,578 @@ PSICTL_EOF
   grn "[+] psictl 已安装"
 }
 
-# ========= vpsmenu (统一入口版 + 内置 psi-setup + 模式切换) =========
+# ========= proxyctl (Free Proxy List 管理工具) =========
+install_proxyctl(){
+  ylw "[*] 安装 proxyctl (免费代理管理工具)..."
+  
+  mkdir -p /etc/freeproxy /var/lib/freeproxy
+  
+  # 初始化配置文件
+  if [[ ! -f /etc/freeproxy/config.json ]]; then
+    cat > /etc/freeproxy/config.json <<'FPCFG'
+{
+  "enabled": false,
+  "country": "US",
+  "protocol": "socks5",
+  "health_interval_min": 10,
+  "current_proxy": null
+}
+FPCFG
+  fi
+  
+  cat > /usr/local/bin/proxyctl <<'PROXYCTL_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+CFG="/etc/freeproxy/config.json"
+CACHE="/var/lib/freeproxy/proxies.json"
+CDN_BASE="https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies"
+
+# 颜色输出
+red(){ echo -e "\033[31m$*\033[0m" >&2; }
+grn(){ echo -e "\033[32m$*\033[0m" >&2; }
+ylw(){ echo -e "\033[33m$*\033[0m" >&2; }
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# 国家代码中文映射
+declare -A CC_ZH
+CC_ZH[US]="美国"; CC_ZH[JP]="日本"; CC_ZH[SG]="新加坡"; CC_ZH[DE]="德国"
+CC_ZH[FR]="法国"; CC_ZH[GB]="英国"; CC_ZH[NL]="荷兰"; CC_ZH[CA]="加拿大"
+CC_ZH[KR]="韩国"; CC_ZH[HK]="香港"; CC_ZH[TW]="台湾"; CC_ZH[AU]="澳大利亚"
+CC_ZH[RU]="俄罗斯"; CC_ZH[BR]="巴西"; CC_ZH[IN]="印度"; CC_ZH[IT]="意大利"
+
+cc_label() {
+  local cc="${1^^}"
+  local zh="${CC_ZH[$cc]:-}"
+  if [[ -n "$zh" ]]; then echo "$cc ($zh)"; else echo "$cc"; fi
+}
+
+# 读取配置
+read_cfg() {
+  local key="$1" default="${2:-}"
+  jq -r ".${key} // empty" "$CFG" 2>/dev/null || echo "$default"
+}
+
+# 写入配置
+write_cfg() {
+  local key="$1" value="$2" tmp
+  tmp="$(mktemp)"
+  if [[ "$value" =~ ^[0-9]+$ ]] || [[ "$value" == "null" ]] || [[ "$value" == "true" ]] || [[ "$value" == "false" ]]; then
+    jq --argjson v "$value" ".$key = \$v" "$CFG" > "$tmp"
+  else
+    jq --arg v "$value" ".$key = \$v" "$CFG" > "$tmp"
+  fi
+  mv "$tmp" "$CFG"
+}
+
+# 获取代理列表
+fetch_proxies() {
+  local country="${1:-US}" protocol="${2:-all}"
+  country="${country^^}"
+  
+  ylw "[*] 正在获取 $country 的代理列表 (协议: $protocol)..."
+  
+  local url proxies
+  if [[ "$protocol" == "all" ]]; then
+    url="${CDN_BASE}/countries/${country}/data.json"
+  else
+    url="${CDN_BASE}/protocols/${protocol}/data.json"
+  fi
+  
+  proxies="$(curl -fsSL --max-time 30 "$url" 2>/dev/null || true)"
+  
+  if [[ -z "$proxies" ]]; then
+    red "[-] 无法获取代理列表"
+    return 1
+  fi
+  
+  # 按国家过滤（如果是协议模式）
+  if [[ "$protocol" != "all" ]]; then
+    proxies="$(echo "$proxies" | jq -c "[.[] | select(.geolocation.country == \"$country\")]")"
+  fi
+  
+  local count
+  count="$(echo "$proxies" | jq 'length')"
+  
+  if [[ "$count" -eq 0 ]]; then
+    red "[-] 没有找到 $country 的 $protocol 代理"
+    return 1
+  fi
+  
+  grn "[+] 获取到 $count 个代理"
+  echo "$proxies" > "$CACHE"
+  
+  write_cfg "country" "$country"
+  [[ "$protocol" != "all" ]] && write_cfg "protocol" "$protocol"
+  
+  echo "$count"
+}
+
+# 测试单个代理连通性和延迟
+test_proxy() {
+  local ip="$1" port="$2" protocol="$3" timeout="${4:-5}"
+  local start end latency
+  
+  start="$(date +%s%3N)"
+  
+  case "$protocol" in
+    socks5|socks4)
+      if curl -fsS --max-time "$timeout" --socks5-hostname "${ip}:${port}" https://ipinfo.io/ip >/dev/null 2>&1; then
+        end="$(date +%s%3N)"
+        latency=$((end - start))
+        echo "$latency"
+        return 0
+      fi
+      ;;
+    http|https)
+      if curl -fsS --max-time "$timeout" --proxy "http://${ip}:${port}" https://ipinfo.io/ip >/dev/null 2>&1; then
+        end="$(date +%s%3N)"
+        latency=$((end - start))
+        echo "$latency"
+        return 0
+      fi
+      ;;
+  esac
+  
+  echo "-1"
+  return 1
+}
+
+# 测试所有代理并排序
+test_all_proxies() {
+  local max="${1:-10}"
+  
+  if [[ ! -f "$CACHE" ]]; then
+    red "[-] 代理缓存为空，请先运行 proxyctl fetch <country>"
+    return 1
+  fi
+  
+  local proxies count
+  proxies="$(cat "$CACHE")"
+  count="$(echo "$proxies" | jq 'length')"
+  
+  [[ "$count" -gt "$max" ]] && count="$max"
+  
+  ylw "[*] 正在测试 $count 个代理..."
+  
+  local results=()
+  for i in $(seq 0 $((count - 1))); do
+    local ip port protocol
+    ip="$(echo "$proxies" | jq -r ".[$i].ip")"
+    port="$(echo "$proxies" | jq -r ".[$i].port")"
+    protocol="$(echo "$proxies" | jq -r ".[$i].protocol")"
+    
+    printf "  测试 %s:%s (%s)... " "$ip" "$port" "$protocol"
+    
+    local latency
+    latency="$(test_proxy "$ip" "$port" "$protocol" 5 || echo "-1")"
+    
+    if [[ "$latency" -ge 0 ]]; then
+      grn "${latency}ms"
+      results+=("$latency|$ip|$port|$protocol")
+    else
+      red "失败"
+    fi
+  done
+  
+  if [[ ${#results[@]} -eq 0 ]]; then
+    red "[-] 没有可用的代理"
+    return 1
+  fi
+  
+  # 按延迟排序
+  IFS=$'\n' sorted=($(sort -t'|' -k1 -n <<<"${results[*]}")); unset IFS
+  
+  echo ""
+  grn "[+] 可用代理列表（按延迟排序）:"
+  local idx=1
+  for r in "${sorted[@]}"; do
+    IFS='|' read -r lat ip port proto <<< "$r"
+    printf "  %2d) %s:%s [%s] - %sms\n" "$idx" "$ip" "$port" "$proto" "$lat"
+    ((idx++))
+  done
+  
+  # 保存排序结果
+  printf '%s\n' "${sorted[@]}" > /var/lib/freeproxy/tested.txt
+  
+  echo "${#sorted[@]}"
+}
+
+# 选择并应用代理
+select_proxy() {
+  if [[ ! -f /var/lib/freeproxy/tested.txt ]]; then
+    red "[-] 请先运行 proxyctl test 测试代理"
+    return 1
+  fi
+  
+  mapfile -t sorted < /var/lib/freeproxy/tested.txt
+  
+  if [[ ${#sorted[@]} -eq 0 ]]; then
+    red "[-] 没有可用代理"
+    return 1
+  fi
+  
+  echo ""
+  echo "可用代理:"
+  local idx=1
+  for r in "${sorted[@]}"; do
+    IFS='|' read -r lat ip port proto <<< "$r"
+    printf "  %2d) %s:%s [%s] - %sms\n" "$idx" "$ip" "$port" "$proto" "$lat"
+    ((idx++))
+  done
+  echo "   0) 取消"
+  echo "   A) 自动选择最低延迟"
+  
+  read -r -p "选择编号: " sel
+  
+  if [[ "${sel^^}" == "A" ]]; then
+    sel=1
+  elif [[ "$sel" == "0" ]]; then
+    return 0
+  fi
+  
+  if ! [[ "$sel" =~ ^[0-9]+$ ]] || [[ "$sel" -lt 1 ]] || [[ "$sel" -gt ${#sorted[@]} ]]; then
+    red "[-] 无效选择"
+    return 1
+  fi
+  
+  local chosen="${sorted[$((sel-1))]}"
+  IFS='|' read -r lat ip port proto <<< "$chosen"
+  
+  apply_proxy "$ip" "$port" "$proto"
+}
+
+# 应用代理到系统
+apply_proxy() {
+  local ip="$1" port="$2" protocol="$3"
+  
+  ylw "[*] 应用代理: $ip:$port ($protocol)"
+  
+  # 保存到配置
+  local tmp
+  tmp="$(mktemp)"
+  jq --arg ip "$ip" --argjson port "$port" --arg proto "$protocol" \
+    '.current_proxy = {"ip": $ip, "port": $port, "protocol": $proto}' "$CFG" > "$tmp"
+  mv "$tmp" "$CFG"
+  
+  # 更新 Xray 配置
+  if [[ -f /etc/xray/config.json ]]; then
+    local outbound
+    case "$protocol" in
+      socks5|socks4)
+        outbound='[{"protocol":"socks","tag":"freeproxy","settings":{"servers":[{"address":"'"$ip"'","port":'"$port"'}]}}]'
+        ;;
+      http|https)
+        outbound='[{"protocol":"http","tag":"freeproxy","settings":{"servers":[{"address":"'"$ip"'","port":'"$port"'}]}}]'
+        ;;
+    esac
+    
+    local routing='{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"freeproxy","network":"tcp,udp"}]}'
+    tmp="$(mktemp)"
+    jq --argjson ob "$outbound" --argjson rt "$routing" \
+      '.outbounds=$ob | .routing=$rt' /etc/xray/config.json > "$tmp"
+    mv "$tmp" /etc/xray/config.json
+    
+    systemctl restart xray 2>/dev/null || true
+    grn "[+] Xray 配置已更新"
+  fi
+  
+  # 更新 Hysteria2 配置
+  if [[ -f /etc/hysteria/config.yaml ]]; then
+    local tmp2
+    tmp2="$(mktemp)"
+    awk '
+      BEGIN{skip=0}
+      /^outbounds:/{skip=1; next}
+      /^acl:/{skip=1; next}
+      /^[a-z]/ && skip{skip=0}
+      {if(!skip) print}
+    ' /etc/hysteria/config.yaml > "$tmp2"
+    
+    case "$protocol" in
+      socks5|socks4)
+        cat >> "$tmp2" <<EOF
+
+outbounds:
+  - name: freeproxy
+    type: socks5
+    socks5:
+      addr: ${ip}:${port}
+
+acl:
+  inline:
+    - freeproxy(all)
+EOF
+        ;;
+      http|https)
+        cat >> "$tmp2" <<EOF
+
+outbounds:
+  - name: freeproxy
+    type: http
+    http:
+      url: http://${ip}:${port}
+
+acl:
+  inline:
+    - freeproxy(all)
+EOF
+        ;;
+    esac
+    
+    mv "$tmp2" /etc/hysteria/config.yaml
+    systemctl restart hysteria2 2>/dev/null || true
+    grn "[+] Hysteria2 配置已更新"
+  fi
+  
+  write_cfg "enabled" "true"
+  grn "[+] 代理已启用: $ip:$port ($protocol)"
+}
+
+# 健康检查
+health_check() {
+  local enabled current_ip current_port current_proto
+  enabled="$(read_cfg "enabled" "false")"
+  
+  if [[ "$enabled" != "true" ]]; then
+    echo "[i] Free Proxy 未启用"
+    return 0
+  fi
+  
+  current_ip="$(jq -r '.current_proxy.ip // empty' "$CFG")"
+  current_port="$(jq -r '.current_proxy.port // empty' "$CFG")"
+  current_proto="$(jq -r '.current_proxy.protocol // empty' "$CFG")"
+  
+  if [[ -z "$current_ip" ]]; then
+    ylw "[!] 没有当前代理配置"
+    return 0
+  fi
+  
+  echo "[*] 健康检查: $current_ip:$current_port ($current_proto)"
+  
+  local latency
+  latency="$(test_proxy "$current_ip" "$current_port" "$current_proto" 10 || echo "-1")"
+  
+  if [[ "$latency" -ge 0 ]]; then
+    grn "[+] 代理正常 - ${latency}ms"
+    return 0
+  fi
+  
+  red "[-] 当前代理不可用，正在切换..."
+  
+  # 重新获取并测试
+  local country
+  country="$(read_cfg "country" "US")"
+  
+  fetch_proxies "$country" "all" >/dev/null 2>&1 || true
+  test_all_proxies 20 >/dev/null 2>&1 || {
+    red "[-] 没有可用代理"
+    return 1
+  }
+  
+  # 自动选择最低延迟
+  if [[ -f /var/lib/freeproxy/tested.txt ]]; then
+    local first
+    first="$(head -1 /var/lib/freeproxy/tested.txt)"
+    if [[ -n "$first" ]]; then
+      IFS='|' read -r lat ip port proto <<< "$first"
+      apply_proxy "$ip" "$port" "$proto"
+      grn "[+] 已自动切换到: $ip:$port ($proto) - ${lat}ms"
+    fi
+  fi
+}
+
+# 设置健康检查间隔
+set_interval() {
+  local minutes="$1"
+  
+  if ! [[ "$minutes" =~ ^[0-9]+$ ]] || [[ "$minutes" -lt 1 ]]; then
+    red "[-] 无效间隔，请输入大于0的分钟数"
+    return 1
+  fi
+  
+  write_cfg "health_interval_min" "$minutes"
+  
+  # 更新 systemd timer
+  if [[ -f /etc/systemd/system/freeproxy-health.timer ]]; then
+    cat > /etc/systemd/system/freeproxy-health.timer <<EOF
+[Unit]
+Description=Free Proxy Health Check Timer
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${minutes}min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl restart freeproxy-health.timer 2>/dev/null || true
+  fi
+  
+  grn "[+] 健康检查间隔已设置为 ${minutes} 分钟"
+}
+
+# 显示状态
+show_status() {
+  echo ""
+  echo "========== Free Proxy 状态 =========="
+  echo ""
+  
+  local enabled country proto interval
+  enabled="$(read_cfg "enabled" "false")"
+  country="$(read_cfg "country" "US")"
+  proto="$(read_cfg "protocol" "all")"
+  interval="$(read_cfg "health_interval_min" "10")"
+  
+  echo "启用状态: $([[ "$enabled" == "true" ]] && echo "✓ 已启用" || echo "✗ 未启用")"
+  echo "出口国家: $(cc_label "$country")"
+  echo "协议过滤: $proto"
+  echo "检查间隔: ${interval} 分钟"
+  echo ""
+  
+  local current_ip current_port current_proto
+  current_ip="$(jq -r '.current_proxy.ip // empty' "$CFG" 2>/dev/null)"
+  current_port="$(jq -r '.current_proxy.port // empty' "$CFG" 2>/dev/null)"
+  current_proto="$(jq -r '.current_proxy.protocol // empty' "$CFG" 2>/dev/null)"
+  
+  if [[ -n "$current_ip" ]]; then
+    echo "当前代理: $current_ip:$current_port ($current_proto)"
+    
+    echo -n "连通性: "
+    local latency
+    latency="$(test_proxy "$current_ip" "$current_port" "$current_proto" 5 || echo "-1")"
+    if [[ "$latency" -ge 0 ]]; then
+      grn "正常 (${latency}ms)"
+    else
+      red "不可用"
+    fi
+  else
+    echo "当前代理: 未设置"
+  fi
+  
+  echo ""
+  echo "====================================="
+}
+
+# 禁用代理
+disable_proxy() {
+  write_cfg "enabled" "false"
+  
+  # 恢复 Xray 直连
+  if [[ -f /etc/xray/config.json ]]; then
+    local tmp
+    tmp="$(mktemp)"
+    jq '.outbounds=[{"protocol":"freedom","tag":"direct","settings":{}}] | .routing={"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"direct","network":"tcp,udp"}]}' \
+      /etc/xray/config.json > "$tmp"
+    mv "$tmp" /etc/xray/config.json
+    systemctl restart xray 2>/dev/null || true
+  fi
+  
+  # 恢复 Hysteria2
+  if [[ -f /etc/hysteria/config.yaml ]]; then
+    local tmp2
+    tmp2="$(mktemp)"
+    awk '
+      BEGIN{skip=0}
+      /^outbounds:/{skip=1; next}
+      /^acl:/{skip=1; next}
+      /^[a-z]/ && skip{skip=0}
+      {if(!skip) print}
+    ' /etc/hysteria/config.yaml > "$tmp2"
+    mv "$tmp2" /etc/hysteria/config.yaml
+    systemctl restart hysteria2 2>/dev/null || true
+  fi
+  
+  grn "[+] Free Proxy 已禁用，已恢复直连"
+}
+
+# 主命令
+case "${1:-}" in
+  fetch)
+    country="${2:-US}"
+    protocol="${3:-all}"
+    fetch_proxies "$country" "$protocol"
+    ;;
+  test)
+    max="${2:-15}"
+    test_all_proxies "$max"
+    ;;
+  switch)
+    select_proxy
+    ;;
+  health)
+    health_check
+    ;;
+  interval)
+    [[ -n "${2:-}" ]] || { echo "用法: proxyctl interval <分钟>"; exit 1; }
+    set_interval "$2"
+    ;;
+  status)
+    show_status
+    ;;
+  disable)
+    disable_proxy
+    ;;
+  *)
+    echo "proxyctl - Free Proxy List 管理工具"
+    echo ""
+    echo "用法:"
+    echo "  proxyctl fetch <country> [protocol]  获取代理列表 (protocol: http/socks4/socks5/all)"
+    echo "  proxyctl test [max]                  测试代理可用性 (默认测试15个)"
+    echo "  proxyctl switch                      选择并切换代理"
+    echo "  proxyctl health                      健康检查 (会自动切换)"
+    echo "  proxyctl interval <分钟>             设置健康检查间隔"
+    echo "  proxyctl status                      查看状态"
+    echo "  proxyctl disable                     禁用代理，恢复直连"
+    echo ""
+    echo "常用国家: US JP SG DE FR GB NL CA KR HK TW"
+    ;;
+esac
+PROXYCTL_EOF
+
+  chmod +x /usr/local/bin/proxyctl
+  grn "[+] proxyctl 已安装"
+}
+
+# ========= freeproxy-health.timer (健康检查定时器) =========
+install_freeproxy_timer(){
+  local interval="${1:-10}"
+  
+  ylw "[*] 安装 Free Proxy 健康检查定时器 (间隔: ${interval}分钟)..."
+  
+  cat > /etc/systemd/system/freeproxy-health.service <<'EOF'
+[Unit]
+Description=Free Proxy Health Check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/proxyctl health
+EOF
+
+  cat > /etc/systemd/system/freeproxy-health.timer <<EOF
+[Unit]
+Description=Free Proxy Health Check Timer
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${interval}min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable freeproxy-health.timer
+  grn "[+] 健康检查定时器已安装"
+}
+
+
 install_menu(){
   ylw "[*] 安装菜单命令 vpsmenu (纯文本菜单)..."
   
@@ -1038,14 +1609,15 @@ pause() { read -r -p $'\n回车继续...' _; }
 # ==================== 文本版菜单（取消 whiptail）====================
 show_text_menu() {
   clear
-  local mode="unknown" psi_status="未安装"
+  local mode="unknown" psi_status="未安装" fp_status="未安装"
   [[ -f "$CLIENT_JSON" ]] && have_cmd jq && mode="$(jq -r '.egress_mode // "unknown"' "$CLIENT_JSON" 2>/dev/null || echo unknown)"
   have_cmd psictl && psi_status="已安装"
+  have_cmd proxyctl && fp_status="已安装"
 
   echo "╔══════════════════════════════════════════════════════════╗"
-  echo "║   多协议入站 + Psiphon 出站 管理菜单 (合并版)            ║"
+  echo "║   多协议入站 + 多出站 管理菜单 (合并版)                  ║"
   echo "╠══════════════════════════════════════════════════════════╣"
-  echo "║  egress_mode=${mode} | psictl=${psi_status}"
+  echo "║  egress_mode=${mode} | psictl=${psi_status} | proxyctl=${fp_status}"
   echo "╠══════════════════════════════════════════════════════════╣"
   echo "║  入站(通用)                                              ║"
   echo "╠══════════════════════════════════════════════════════════╣"
@@ -1062,12 +1634,22 @@ show_text_menu() {
   echo "║   8) 智能选出口                                          ║"
   echo "║   9) Psiphon 日志                                        ║"
   echo "╠══════════════════════════════════════════════════════════╣"
+  echo "║  Free Proxy (免费代理)                                   ║"
+  echo "╠══════════════════════════════════════════════════════════╣"
+  echo "║  20) 选择国家/协议 + 获取代理                            ║"
+  echo "║  21) 测试代理可用性                                      ║"
+  echo "║  22) 切换代理节点                                        ║"
+  echo "║  23) 查看状态                                            ║"
+  echo "║  24) 设置检查间隔                                        ║"
+  echo "║  25) 禁用代理(恢复直连)                                  ║"
+  echo "╠══════════════════════════════════════════════════════════╣"
   echo "║  出站模式                                                ║"
   echo "╠══════════════════════════════════════════════════════════╣"
-  echo "║  10) 出口 IP 检测 (direct / psiphon)                     ║"
-  echo "║  11) 切换出站模式 (direct/psiphon)                       ║"
+  echo "║  10) 出口 IP 检测 (direct / psiphon / freeproxy)         ║"
+  echo "║  11) 切换出站模式 (direct/psiphon/freeproxy)             ║"
   echo "╠══════════════════════════════════════════════════════════╣"
-  echo "║   A) 安装/更新 Psiphon 组件 (不动入站)                   ║"
+  echo "║   A) 安装/更新 Psiphon 组件                              ║"
+  echo "║   B) 安装/更新 Free Proxy 组件                           ║"
   echo "║   0) 退出                                                ║"
   echo "╚══════════════════════════════════════════════════════════╝"
 }
@@ -1402,41 +1984,70 @@ switch_egress_mode() {
   echo ""
   echo "当前模式: $current_mode"
   echo ""
-  echo "1) direct   (全直连)"
-  echo "2) psiphon  (全走 Psiphon)"
+  echo "1) direct    (全直连)"
+  echo "2) psiphon   (全走 Psiphon)"
+  echo "3) freeproxy (全走免费代理)"
   echo "0) 取消"
-  read -r -p "选择 [0-2]: " n
+  read -r -p "选择 [0-3]: " n
 
   local mode
   case "$n" in
     1) mode="direct" ;;
     2) mode="psiphon" ;;
+    3) mode="freeproxy" ;;
     0) return 0 ;;
     *) echo "[-] 无效选择"; return 0 ;;
   esac
 
   # psiphon 模式必须要有 psictl / Psiphon
-  if [[ "$mode" != "direct" ]] && ! have_cmd psictl; then
+  if [[ "$mode" == "psiphon" ]] && ! have_cmd psictl; then
     echo ""
     echo "[-] 未检测到 psictl / Psiphon 组件。"
     echo "    请先在菜单里选 'A' 安装 Psiphon 组件，然后再切换模式。"
     return 0
   fi
 
-  set_client_mode "$mode"
-  xray_apply_mode "$mode"
-  hy2_apply_mode "$mode"
-  rewrite_units_by_mode "$mode"
-
-  if [[ "$mode" == "direct" ]]; then
-    systemctl stop psiphon 2>/dev/null || true
-    echo "[*] psiphon.service 已停止"
-  else
-    systemctl enable --now psiphon 2>/dev/null || systemctl start psiphon 2>/dev/null || true
-    echo "[*] psiphon.service 已启动"
+  # freeproxy 模式必须要有 proxyctl
+  if [[ "$mode" == "freeproxy" ]] && ! have_cmd proxyctl; then
+    echo ""
+    echo "[-] 未检测到 proxyctl / Free Proxy 组件。"
+    echo "    请先在菜单里选 'B' 安装 Free Proxy 组件，然后再切换模式。"
+    return 0
   fi
 
-  systemctl restart xray hysteria2 2>/dev/null || true
+  set_client_mode "$mode"
+  
+  if [[ "$mode" == "freeproxy" ]]; then
+    # freeproxy 模式：检查是否有配置好的代理
+    local fp_enabled
+    fp_enabled="$(jq -r '.enabled // false' /etc/freeproxy/config.json 2>/dev/null || echo false)"
+    if [[ "$fp_enabled" != "true" ]]; then
+      echo ""
+      echo "[!] Free Proxy 尚未配置。请先使用菜单 20-22 获取并选择代理。"
+      echo "    或者运行: proxyctl fetch US && proxyctl test && proxyctl switch"
+    else
+      echo "[+] Free Proxy 已启用"
+    fi
+    # 启动健康检查定时器
+    systemctl enable --now freeproxy-health.timer 2>/dev/null || true
+    systemctl stop psiphon 2>/dev/null || true
+  else
+    xray_apply_mode "$mode"
+    hy2_apply_mode "$mode"
+    rewrite_units_by_mode "$mode"
+
+    if [[ "$mode" == "direct" ]]; then
+      systemctl stop psiphon 2>/dev/null || true
+      systemctl stop freeproxy-health.timer 2>/dev/null || true
+      echo "[*] psiphon.service 已停止"
+    else
+      systemctl enable --now psiphon 2>/dev/null || systemctl start psiphon 2>/dev/null || true
+      systemctl stop freeproxy-health.timer 2>/dev/null || true
+      echo "[*] psiphon.service 已启动"
+    fi
+
+    systemctl restart xray hysteria2 2>/dev/null || true
+  fi
 
   echo ""
   echo "[+] 已切换为: $mode"
@@ -1451,7 +2062,149 @@ psi_logs() {
   fi
 }
 
-# ==================== 内置 psi-setup（只装 Psiphon 组件，不动入站）====================
+# ==================== Free Proxy 菜单函数 ====================
+fp_guard() {
+  if ! have_cmd proxyctl; then
+    echo ""
+    echo "╔══════════════════════════════════════════════════════╗"
+    echo "║  未检测到 proxyctl（Free Proxy 组件未安装）          ║"
+    echo "║  请先选择 'B' 安装 Free Proxy 组件                   ║"
+    echo "╚══════════════════════════════════════════════════════╝"
+    return 1
+  fi
+  return 0
+}
+
+fp_fetch() {
+  fp_guard || return 0
+  echo ""
+  echo "常用国家: US JP SG DE FR GB NL CA KR HK TW"
+  read -r -p "输入国家代码 [US]: " country
+  country="${country:-US}"
+  
+  echo ""
+  echo "协议选择:"
+  echo "  1) all (全部)"
+  echo "  2) socks5"
+  echo "  3) socks4"
+  echo "  4) http"
+  read -r -p "选择 [1]: " proto_sel
+  local protocol
+  case "$proto_sel" in
+    2) protocol="socks5" ;;
+    3) protocol="socks4" ;;
+    4) protocol="http" ;;
+    *) protocol="all" ;;
+  esac
+  
+  proxyctl fetch "$country" "$protocol"
+}
+
+fp_test() { fp_guard || return 0; proxyctl test; }
+fp_switch() { fp_guard || return 0; proxyctl switch; }
+fp_status() { fp_guard || return 0; proxyctl status; }
+fp_disable() { fp_guard || return 0; proxyctl disable; }
+
+fp_interval() {
+  fp_guard || return 0
+  local current
+  current="$(jq -r '.health_interval_min // 10' /etc/freeproxy/config.json 2>/dev/null || echo 10)"
+  echo ""
+  echo "当前检查间隔: ${current} 分钟"
+  read -r -p "输入新间隔 (分钟): " mins
+  if [[ -n "$mins" ]]; then
+    proxyctl interval "$mins"
+  fi
+}
+
+# ==================== Free Proxy 组件安装 ====================
+fp_setup() {
+  if ! is_root; then
+    echo "[-] 请用 root 运行"
+    return 1
+  fi
+
+  echo ""
+  echo "╔══════════════════════════════════════════════════════╗"
+  echo "║  安装/更新 Free Proxy 组件                           ║"
+  echo "╚══════════════════════════════════════════════════════╝"
+  echo ""
+  
+  # 安装依赖
+  if have_cmd apt-get; then
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y curl jq >/dev/null 2>&1 || true
+  elif have_cmd dnf; then
+    dnf -y install curl jq >/dev/null 2>&1 || true
+  elif have_cmd yum; then
+    yum -y install curl jq >/dev/null 2>&1 || true
+  fi
+
+  mkdir -p /etc/freeproxy /var/lib/freeproxy
+  
+  # 初始化配置文件
+  if [[ ! -f /etc/freeproxy/config.json ]]; then
+    local interval
+    read -r -p "健康检查间隔 (分钟) [10]: " interval
+    interval="${interval:-10}"
+    cat > /etc/freeproxy/config.json <<EOF
+{
+  "enabled": false,
+  "country": "US",
+  "protocol": "socks5",
+  "health_interval_min": $interval,
+  "current_proxy": null
+}
+EOF
+  else
+    echo "[*] 配置文件已存在，保留现有配置"
+  fi
+  
+  # 安装 proxyctl (从 install.sh 中提取)
+  # 这里我们用简化版 - 只需确保 proxyctl 命令可用
+  if ! have_cmd proxyctl; then
+    echo "[!] proxyctl 需要通过完整安装脚本安装"
+    echo "    请运行: bash install.sh"
+    return 1
+  fi
+  
+  # 安装健康检查定时器
+  cat > /etc/systemd/system/freeproxy-health.service <<'EOF'
+[Unit]
+Description=Free Proxy Health Check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/proxyctl health
+EOF
+
+  local interval
+  interval="$(jq -r '.health_interval_min // 10' /etc/freeproxy/config.json 2>/dev/null || echo 10)"
+  cat > /etc/systemd/system/freeproxy-health.timer <<EOF
+[Unit]
+Description=Free Proxy Health Check Timer
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${interval}min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable freeproxy-health.timer
+  
+  echo ""
+  echo "[+] Free Proxy 组件安装完成！"
+  echo "    使用菜单 20-22 获取并选择代理"
+  echo "    使用菜单 11 切换到 freeproxy 模式"
+}
+
+
 psi_setup() {
   if ! is_root; then
     echo "[-] 请用 root 运行"
@@ -1671,7 +2424,7 @@ PSICTL
 main() {
   while true; do
     show_text_menu
-    read -r -p "请选择 [0-11/A]: " choice || true
+    read -r -p "请选择 [0-25/A/B]: " choice || true
 
     case "${choice:-}" in
       1) view_links; pause ;;
@@ -1685,7 +2438,14 @@ main() {
       9) psi_logs; pause ;;
       10) egress_ip_detect; pause ;;
       11) switch_egress_mode; pause ;;
+      20) fp_fetch; pause ;;
+      21) fp_test; pause ;;
+      22) fp_switch; pause ;;
+      23) fp_status; pause ;;
+      24) fp_interval; pause ;;
+      25) fp_disable; pause ;;
       [Aa]) psi_setup; pause ;;
+      [Bb]) fp_setup; pause ;;
       0) exit 0 ;;
       *) [[ -n "${choice:-}" ]] && echo "无效输入: $choice" && pause ;;
     esac
@@ -1868,9 +2628,9 @@ main(){
   prompt CERT_MODE "HY2/TUIC TLS证书模式：le(自动申请) 或 self(自签)" "$DEFAULT_CERT_MODE"
 
   # 出站模式选择
-  prompt EGRESS_MODE "出站模式: direct(直连) psiphon(全走Psiphon)" "$DEFAULT_EGRESS_MODE"
+  prompt EGRESS_MODE "出站模式: direct(直连) psiphon(全走Psiphon) freeproxy(免费代理)" "$DEFAULT_EGRESS_MODE"
   EGRESS_MODE="${EGRESS_MODE,,}"  # 转小写
-  if [[ ! "$EGRESS_MODE" =~ ^(direct|psiphon)$ ]]; then
+  if [[ ! "$EGRESS_MODE" =~ ^(direct|psiphon|freeproxy)$ ]]; then
     ylw "[!] 无效的出站模式，使用默认值: direct"
     EGRESS_MODE="direct"
   fi
@@ -1899,12 +2659,19 @@ main(){
   install_hysteria2
   install_tuic_server
 
-  # psiphon 模式安装 psictl
-  if [[ "$EGRESS_MODE" != "direct" ]]; then
-    install_psictl
+  # 始终安装 psictl 和 proxyctl 以便菜单使用
+  install_psictl
+  install_proxyctl
+  
+  # freeproxy 模式安装定时器
+  if [[ "$EGRESS_MODE" == "freeproxy" ]]; then
+    install_freeproxy_timer 10
+    ylw "[*] freeproxy 模式：请运行 vpsmenu 后选择 20-22 配置代理"
   fi
+  
   install_menu
 
+  save_client_json
   print_client_info
   grn "[+] 安装完成！"
 }

@@ -386,8 +386,8 @@ install_xray_vless_reality(){
   local xray_outbounds xray_routing xray_sniffing
   
   case "$EGRESS_MODE" in
-    direct)
-      # 直连模式：所有流量直连
+    direct|freeproxy)
+      # 直连模式 / freeproxy模式（proxyctl 会后续配置）：初始所有流量直连
       xray_outbounds='
     { "protocol": "freedom", "tag": "direct", "settings": {} }
   '
@@ -557,8 +557,8 @@ EOF
 
   # 根据出站模式追加 outbounds 和 ACL 配置
   case "$EGRESS_MODE" in
-    direct)
-      # 直连模式：不添加 outbounds（Hysteria2 默认直连）
+    direct|freeproxy)
+      # 直连模式 / freeproxy模式：不添加 outbounds（默认直连，proxyctl 会后续配置）
       ;;
     psiphon)
       # 全局 Psiphon: TCP+UDP 都走 Psiphon socks5
@@ -2636,12 +2636,12 @@ main(){
   fi
 
   # psiphon 模式需要 Psiphon 参数
-  if [[ "$EGRESS_MODE" != "direct" ]]; then
+  if [[ "$EGRESS_MODE" == "psiphon" ]]; then
     prompt PSIPHON_REGION "Psiphon 出站国家(两位代码，如 US/JP/SG/DE，AUTO=自动)" "$DEFAULT_PSIPHON_REGION"
     prompt PSIPHON_SOCKS "Psiphon 本地 SOCKS5 端口" "$DEFAULT_PSIPHON_SOCKS"
     prompt PSIPHON_HTTP "Psiphon 本地 HTTP 代理端口" "$DEFAULT_PSIPHON_HTTP"
   else
-    # direct 模式不需要 Psiphon，设置默认值避免 unbound variable
+    # direct/freeproxy 模式不需要 Psiphon，设置默认值避免 unbound variable
     PSIPHON_REGION=""
     PSIPHON_SOCKS="1081"
     PSIPHON_HTTP="8081"
@@ -2651,7 +2651,7 @@ main(){
   ylw "[*] 出站模式: ${EGRESS_MODE}"
 
   # psiphon 模式安装 Psiphon
-  if [[ "$EGRESS_MODE" != "direct" ]]; then
+  if [[ "$EGRESS_MODE" == "psiphon" ]]; then
     install_psiphon
   fi
 

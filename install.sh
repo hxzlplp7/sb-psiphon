@@ -821,13 +821,22 @@ install_sing_box_anytls(){
 
   local dl_asset="${t_tmpd}/sing-box.tar.gz"
   local dl_ok=0
-  # 先尝试 CDN 加速下载，失败则尝试直连 GitHub
-  ylw "[*] 正在下载 sing-box (CDN -> GitHub 双保険)..."
-  if curl -fL --progress-bar --max-time 60 "$url_cdn" -o "$dl_asset" 2>/dev/null && [[ -s "$dl_asset" ]]; then
-    dl_ok=1
-  elif curl -fL --progress-bar --max-time 90 "$url" -o "$dl_asset" 2>/dev/null && [[ -s "$dl_asset" ]]; then
-    dl_ok=1
-  fi
+  # 多个 CDN 镜像依次快速尝试，防止单个镜像卡住
+  local mirrors=(
+    "https://ghproxy.net/${url}"
+    "https://mirror.ghproxy.com/${url}"
+    "https://github.moeyy.xyz/${url}"
+    "$url"
+  )
+  for mirror in "${mirrors[@]}"; do
+    ylw "[*] 尝试下载: ${mirror:0:60}..."
+    if curl -fL --progress-bar --max-time 45 --connect-timeout 10 "$mirror" -o "$dl_asset" 2>/dev/null && [[ -s "$dl_asset" ]]; then
+      dl_ok=1
+      break
+    fi
+    ylw "[!] 该镜像失败，尝试下一个..."
+    rm -f "$dl_asset"
+  done
 
   if [[ "$dl_ok" -ne 1 || ! -s "$dl_asset" ]]; then
       red "[-] 错误：sing-box 下载失败。请检查网络连接或 GitHub 访问情况。"

@@ -577,9 +577,8 @@ install_hysteria2(){
   fi
   chmod +x /usr/local/bin/hysteria
 
-  local hy_pass obfs_pass
+  local hy_pass
   hy_pass="$(rand_hex 12)"
-  obfs_pass="$(rand_hex 12)"
 
   mkdir -p /etc/hysteria /etc/ssl/sbox
 
@@ -603,10 +602,6 @@ tls:
 auth:
   type: password
   password: ${hy_pass}
-obfs:
-  type: salamander
-  salamander:
-    password: ${obfs_pass}
 EOF
   else
     # 自签证书模式 - 基础配置
@@ -619,10 +614,6 @@ tls:
 auth:
   type: password
   password: ${hy_pass}
-obfs:
-  type: salamander
-  salamander:
-    password: ${obfs_pass}
 EOF
   fi
 
@@ -680,7 +671,7 @@ EOF
   grn "[+] Hysteria2 已启动"
 
   HY2_PASS="$hy_pass"
-  HY2_OBFS="$obfs_pass"
+  HY2_OBFS=""
 }
 
 # ========= TUIC =========
@@ -1221,12 +1212,11 @@ show_links() {
   vless_link="vless://${v_uuid}@${host}:${v_port}?encryption=none&security=reality&sni=${v_sni}&fp=chrome&pbk=${v_pbk}&sid=${v_sid}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
 
   # Hysteria2
-  local h_port h_auth h_obfs h_sni hy2_link
+  local h_port h_auth h_sni hy2_link
   h_port="$(jq -r '.hy2.port // empty' "$f")"
   h_auth="$(jq -r '.hy2.auth // empty' "$f")"
-  h_obfs="$(jq -r '.hy2.obfs_password // empty' "$f")"
   h_sni="$(jq -r '.hy2.sni // "www.bing.com"' "$f")"
-  hy2_link="hysteria2://${h_auth}@${host}:${h_port}/?obfs=salamander&obfs-password=${h_obfs}&sni=${h_sni}&insecure=${insecure}&alpn=h3#HY2"
+  hy2_link="hysteria2://${h_auth}@${host}:${h_port}/?sni=${h_sni}&insecure=${insecure}&alpn=h3#HY2"
 
   # TUIC
   local t_port t_uuid t_pass t_sni tuic_link
@@ -2198,10 +2188,9 @@ view_links() {
     v_pbk="$(jq -r '.vless.pbk // empty' "$CLIENT_JSON")"
     v_sid="$(jq -r '.vless.sid // empty' "$CLIENT_JSON")"
 
-    local h_port h_auth h_obfs h_sni
+    local h_port h_auth h_sni
     h_port="$(jq -r '.hy2.port // empty' "$CLIENT_JSON")"
     h_auth="$(jq -r '.hy2.auth // empty' "$CLIENT_JSON")"
-    h_obfs="$(jq -r '.hy2.obfs_password // empty' "$CLIENT_JSON")"
     h_sni="$(jq -r '.hy2.sni // "www.bing.com"' "$CLIENT_JSON")"
 
     local t_port t_uuid t_pass t_sni
@@ -2227,7 +2216,7 @@ view_links() {
     if [[ -n "$h_auth" && "$h_auth" != "null" ]]; then
       echo ""
       echo "[Hysteria2]"
-      echo "hysteria2://${h_auth}@${host}:${h_port}/?obfs=salamander&obfs-password=${h_obfs}&sni=${h_sni}&insecure=${insecure}&alpn=h3#HY2"
+      echo "hysteria2://${h_auth}@${host}:${h_port}/?sni=${h_sni}&insecure=${insecure}&alpn=h3#HY2"
       shown=1
     fi
     if [[ -n "$t_uuid" && "$t_uuid" != "null" ]]; then
@@ -2930,10 +2919,10 @@ case "${1:-}" in
       echo "vless://${v_uuid}@${host}:${v_port}?encryption=none&security=reality&sni=${v_sni}&fp=chrome&pbk=${v_pbk}&sid=${v_sid}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
       shown=1
     fi
-    h_port="$(jq -r '.hy2.port // empty' "$f")"; h_auth="$(jq -r '.hy2.auth // empty' "$f")"; h_obfs="$(jq -r '.hy2.obfs_password // empty' "$f")"; h_sni="$(jq -r '.hy2.sni // "www.bing.com"' "$f")"
+    h_port="$(jq -r '.hy2.port // empty' "$f")"; h_auth="$(jq -r '.hy2.auth // empty' "$f")"; h_sni="$(jq -r '.hy2.sni // "www.bing.com"' "$f")"
     if [[ -n "$h_auth" && "$h_auth" != "null" ]]; then
       echo "[Hysteria2]"
-      echo "hysteria2://${h_auth}@${host}:${h_port}/?obfs=salamander&obfs-password=${h_obfs}&sni=${h_sni}&insecure=${insecure}&alpn=h3#HY2"
+      echo "hysteria2://${h_auth}@${host}:${h_port}/?sni=${h_sni}&insecure=${insecure}&alpn=h3#HY2"
       shown=1
     fi
     t_uuid="$(jq -r '.tuic.uuid // empty' "$f")"
@@ -3053,8 +3042,8 @@ save_client_json(){
     "enabled": ${h_en},
     "port": ${HY2_PORT},
     "auth": "${HY2_PASS}",
-    "obfs": "salamander",
-    "obfs_password": "${HY2_OBFS}",
+    "obfs": "",
+    "obfs_password": "",
     "sni": "${QUIC_SNI}",
     "insecure": ${insecure}
   },
@@ -3091,7 +3080,7 @@ print_client_info(){
   # 生成分享链接（HY2/TUIC 使用伪装站点 SNI）
   local vless_link="" hy2_link="" tuic_link="" anytls_link=""
   [[ -n "${VLESS_UUID:-}" ]] && vless_link="vless://${VLESS_UUID}@${HOST}:${VLESS_PORT}?encryption=none&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
-  [[ -n "${HY2_PASS:-}" ]] && hy2_link="hysteria2://${HY2_PASS}@${HOST}:${HY2_PORT}/?obfs=salamander&obfs-password=${HY2_OBFS}&sni=${QUIC_SNI}&insecure=${insecure}&alpn=h3#HY2"
+  [[ -n "${HY2_PASS:-}" ]] && hy2_link="hysteria2://${HY2_PASS}@${HOST}:${HY2_PORT}/?sni=${QUIC_SNI}&insecure=${insecure}&alpn=h3#HY2"
   [[ -n "${TUIC_UUID:-}" ]] && tuic_link="tuic://${TUIC_UUID}:${TUIC_PASS}@${HOST}:${TUIC_PORT}?alpn=h3&udp_relay_mode=native&congestion_control=bbr&sni=${QUIC_SNI}&allow_insecure=${insecure}#TUIC-v5"
   [[ -n "${ANYTLS_UUID:-}" ]] && anytls_link="anytls://${ANYTLS_UUID}@${HOST}:${ANYTLS_PORT}?sni=${QUIC_SNI}&allowInsecure=${insecure}#AnyTLS"
 
@@ -3122,7 +3111,6 @@ EOF
   地址: ${HOST}
   端口: ${HY2_PORT} (UDP)
   密码: ${HY2_PASS}
-  OBFS密码: ${HY2_OBFS}
 EOF
     shown=1
   fi

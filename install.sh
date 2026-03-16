@@ -173,9 +173,9 @@ download_file(){
   ylw "[*] 正在下载: $url"
   sleep 1  # 避开 NAT 瞬时高峰
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --retry 3 --max-time 60 "$url" -o "$tmp" || { red "[-] 下载失败: $url"; return 1; }
+    curl -fL --progress-bar --retry 3 --max-time 60 "$url" -o "$tmp" || { red "[-] 下载失败: $url"; return 1; }
   else
-    wget -qO "$tmp" "$url" --timeout=60 || { red "[-] 下载失败: $url"; return 1; }
+    wget -O "$tmp" "$url" --timeout=60 --progress=bar:force:noscroll || { red "[-] 下载失败: $url"; return 1; }
   fi
   if [[ ! -s "$tmp" ]]; then
     red "[-] 下载的文件为空: $url"
@@ -712,9 +712,9 @@ install_sing_box_anytls(){
   local dl_asset="${t_tmpd}/sing-box.tar.gz"
   local dl_ok=0
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --max-time 30 "$url" -o "$dl_asset" && dl_ok=1
+    curl -fL --progress-bar --max-time 30 "$url" -o "$dl_asset" && dl_ok=1
   else
-    wget -qO "$dl_asset" "$url" --timeout=30 && dl_ok=1
+    wget -O "$dl_asset" "$url" --timeout=30 --progress=bar:force:noscroll && dl_ok=1
   fi
 
   if [[ "$dl_ok" -ne 1 || ! -s "$dl_asset" ]]; then

@@ -5,10 +5,9 @@
 在一台 Linux VPS 上部署：
 
 - **入站协议**（使用各协议官方/主流实现）：
-  - **VLESS + REALITY**（Xray-core）
+  - **VLESS + REALITY + AnyTLS**（SagerNet/sing-box）
   - **Hysteria2**（apernet/hysteria）
   - **TUIC v5**（EAimTY/tuic）
-  - **AnyTLS**（SagerNet/sing-box）
 
 - **出站模式**（三选一）：
   | 模式 | 说明 |
@@ -37,10 +36,9 @@
 ┌─────────────────────────────────────────────────────────────┐
 │                      VPS 服务端                             │
 │  ┌─────────────────────────────────────────────────────┐   │
-│  │  Xray (VLESS+Reality)  :443 TCP                     │   │
+│  │  sing-box (VLESS/REALITY/AnyTLS)                     │   │
 │  │  Hysteria2             :8443 UDP                    │   │
 │  │  TUIC                  :2053 UDP (固定直连)          │   │
-│  │  AnyTLS                :10443 TCP (sing-box)         │   │
 │  │                                                      │   │
 │  │  ↓ smart 模式：AI/流媒体→Psiphon，其余→直连 ↓       │   │
 │  └─────────────────────────┬───────────────────────────┘   │
@@ -126,8 +124,7 @@ psictl smart-country
 
 # 查看日志
 psictl logs          # 全部
-psictl logs psi      # psiphon
-psictl logs xray     # xray
+psictl logs sb       # sing-box (VLESS/REALITY/AnyTLS)
 psictl logs hy2      # hysteria2
 psictl logs tuic     # tuic
 psictl logs anytls   # anytls (sing-box)
@@ -157,7 +154,7 @@ Psiphon 支持以下国家（使用两位国家代码）：
 | 服务 | 配置文件 |
 |------|----------|
 | Psiphon | `/etc/psiphon/psiphon.config` |
-| Xray | `/etc/xray/config.json` |
+| sing-box | `/etc/sing-box/config.json` |
 | Hysteria2 | `/etc/hysteria/config.yaml` |
 | TUIC | `/etc/tuic/config.json` |
 | AnyTLS (sing-box) | `/etc/sing-box/config.json` |
@@ -165,7 +162,7 @@ Psiphon 支持以下国家（使用两位国家代码）：
 
 ## 客户端配置示例
 
-### VLESS + REALITY (Xray)
+### VLESS + REALITY (sing-box)
 
 ```
 地址: <你的HOST>
@@ -245,7 +242,7 @@ A:
 
 ### 1. 检查服务状态
 ```bash
-systemctl status psiphon xray hysteria2 tuic sing-box
+systemctl status psiphon sing-box hysteria2 tuic
 ```
 
 ### 2. 查看详细日志

@@ -686,29 +686,29 @@ EOF
   TUIC_PASS="$tuic_pass"
 }
 
-# ========= sing-box AnyTLS =========
+# ========= sing-box (VLESS + REALITY + AnyTLS) =========
 install_sing_box_anytls(){
   local arch
   arch="$(detect_arch)"
 
-  ylw "[*] 安装 sing-box (AnyTLS)..."
-  
+  ylw "[*] 安装 sing-box (VLESS+REALITY + AnyTLS)..."
+
   # 获取最新的 sing-box 版本 (1.12.0+)
   local latest_version url
   ylw "[*] 正在获取 sing-box 最新版本..."
   latest_version="$(curl -fsSL --max-time 10 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r .tag_name | sed 's/^v//' || echo "")"
-  
+
   if [[ -z "$latest_version" || "$latest_version" == "null" ]]; then
       ylw "[!] 无法从 GitHub API 获取最新版本，尝试使用默认稳定版 v1.12.1"
       latest_version="1.12.1"
   fi
-  
+
   url="https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${arch}.tar.gz"
 
   local t_tmpd
   t_tmpd="$(mktemp -d)"
   ylw "[*] 正在下载 sing-box v${latest_version}..."
-  
+
   local dl_asset="${t_tmpd}/sing-box.tar.gz"
   local dl_ok=0
   if command -v curl >/dev/null 2>&1; then
@@ -722,7 +722,7 @@ install_sing_box_anytls(){
       rm -rf "$t_tmpd"
       return 1
   fi
-  
+
   # 简易校验是否为 tar.gz
   if ! file "$dl_asset" 2>/dev/null | grep -q "gzip"; then
       if ! tar -tzf "$dl_asset" >/dev/null 2>&1; then
@@ -737,7 +737,7 @@ install_sing_box_anytls(){
       rm -rf "$t_tmpd"
       return 1
   fi
-  
+
   local extracted
   extracted="$(find "$t_tmpd" -maxdepth 2 -type f -name 'sing-box' | head -n1)"
   if [[ -z "$extracted" || ! -f "$extracted" ]]; then
@@ -747,15 +747,36 @@ install_sing_box_anytls(){
   fi
   install -m 0755 "$extracted" /usr/local/bin/sing-box
   rm -rf "$t_tmpd"
-  
+
   mkdir -p /etc/sing-box
-  
-  # 生成配置
-  local uuid cert_path key_path
-  uuid="$(gen_uuid)"
-  
-  # 证书强制使用自签：对于 AnyTLS，为保证启动成功，默认使用自签。
-  # 用户若需 LE 证书，可手动修改或集成外部 ACME。
+
+  # 生成 VLESS + REALITY 参数
+  local vless_uuid keypair priv pub sid
+  vless_uuid="$(gen_uuid)"
+  keypair="$(/usr/local/bin/sing-box generate reality-keypair 2>/dev/null || true)"
+  if echo "$keypair" | jq -e . >/dev/null 2>&1; then
+    priv="$(echo "$keypair" | jq -r '.private_key // .privateKey // empty')"
+    pub="$(echo "$keypair" | jq -r '.public_key // .publicKey // empty')"
+  else
+    priv="$(echo "$keypair" | awk -F': *' '/^PrivateKey:/ {print $2; exit} /^Private key:/ {print $2; exit}')"
+    pub="$(echo "$keypair" | awk -F': *' '/^PublicKey:/ {print $2; exit} /^Public key:/ {print $2; exit}')"
+  fi
+
+  if [[ -z "$priv" || -z "$pub" || ${#priv} -lt 20 || ${#pub} -lt 20 ]]; then
+    red "[-] REALITY 密钥生成失败，请检查 sing-box 是否可用："
+    echo "$keypair"
+    return 1
+  fi
+
+  sid="$(rand_hex 8)"
+
+  grn "[+] REALITY 密钥生成成功"
+  grn "    PrivateKey: ${priv:0:10}..."
+  grn "    PublicKey:  ${pub:0:10}..."
+
+  # AnyTLS 账号
+  local anytls_uuid cert_path key_path
+  anytls_uuid="$(gen_uuid)"
   cert_path="/etc/ssl/sbox/self.crt"
   key_path="/etc/ssl/sbox/self.key"
 
@@ -763,32 +784,71 @@ install_sing_box_anytls(){
   cat > /etc/sing-box/config.json <<EOF
 {
   "log": {"level": "warn"},
-  "inbounds": [{
-    "type": "anytls",
-    "tag": "anytls-in",
-    "listen": "::",
-    "listen_port": ${ANYTLS_PORT},
-    "users": [{"password": "${uuid}"}],
-    "tls": {
-      "enabled": true,
-      "certificate_path": "${cert_path}",
-      "key_path": "${key_path}"
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-in",
+      "listen": "::",
+      "listen_port": ${VLESS_PORT},
+      "users": [{"uuid": "${vless_uuid}", "flow": "xtls-rprx-vision"}],
+      "sniff": true,
+      "sniff_override_destination": true,
+      "tls": {
+        "enabled": true,
+        "server_name": "${REALITY_SNI}",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "${REALITY_SNI}",
+            "server_port": 443
+          },
+          "private_key": "${priv}",
+          "short_id": ["${sid}"]
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "anytls-in",
+      "listen": "::",
+      "listen_port": ${ANYTLS_PORT},
+      "users": [{"password": "${anytls_uuid}"}],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "${cert_path}",
+        "key_path": "${key_path}"
+      }
     }
-  }],
+  ],
   "outbounds": [{"type": "direct", "tag": "direct"}]
 }
 EOF
 
-  # 保存 UUID 以供后续使用
-  ANYTLS_UUID="$uuid"
+  # 保存参数
+  VLESS_UUID="$vless_uuid"
+  REALITY_PRIV="$priv"
+  REALITY_PUB="$pub"
+  REALITY_SID="$sid"
+  ANYTLS_UUID="$anytls_uuid"
 
   # 应用初始出口模式
   anytls_apply_mode "$EGRESS_MODE"
 
+  # systemd unit: psiphon 模式依赖 psiphon.service
+  local unit_after unit_wants
+  if [[ "$EGRESS_MODE" != "direct" ]]; then
+    unit_after="After=network-online.target psiphon.service"
+    unit_wants="Wants=network-online.target psiphon.service"
+  else
+    unit_after="After=network-online.target"
+    unit_wants="Wants=network-online.target"
+  fi
+
   cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
-Description=sing-box service (AnyTLS)
-After=network.target nss-lookup.target
+Description=sing-box service (VLESS+REALITY + AnyTLS)
+${unit_after}
+${unit_wants}
 
 [Service]
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
@@ -804,7 +864,7 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now sing-box
-  grn "[+] sing-box (AnyTLS) 已启动"
+  grn "[+] sing-box 已启动：VLESS+REALITY + AnyTLS"
 }
 
 anytls_apply_mode() {
@@ -812,16 +872,23 @@ anytls_apply_mode() {
   local cfg="/etc/sing-box/config.json"
   [[ -f "$cfg" ]] || return 0
 
-  # 从现有配置读取 UUID 和 证书路径
-  local uuid cert key port
-  uuid="$(jq -r '.inbounds[0].users[0].password // empty' "$cfg")"
-  cert="$(jq -r '.inbounds[0].tls.certificate_path // "/etc/ssl/sbox/self.crt"' "$cfg")"
-  key="$(jq -r '.inbounds[0].tls.key_path // "/etc/ssl/sbox/self.key"' "$cfg")"
-  port="$(jq -r '.inbounds[0].listen_port // 10443' "$cfg")"
-  
-  [[ -z "$uuid" ]] && return 0
+  # 读取现有配置
+  local v_uuid v_port r_sni r_priv r_sid
+  local a_uuid a_port cert key
+  v_uuid="$(jq -r '.inbounds[] | select(.tag=="vless-in") | .users[0].uuid // empty' "$cfg")"
+  v_port="$(jq -r '.inbounds[] | select(.tag=="vless-in") | .listen_port // empty' "$cfg")"
+  r_sni="$(jq -r '.inbounds[] | select(.tag=="vless-in") | .tls.server_name // empty' "$cfg")"
+  r_priv="$(jq -r '.inbounds[] | select(.tag=="vless-in") | .tls.reality.private_key // empty' "$cfg")"
+  r_sid="$(jq -r '.inbounds[] | select(.tag=="vless-in") | .tls.reality.short_id[0] // empty' "$cfg")"
 
-  local out_type="direct" out_tag="direct" ob_json='{"type":"direct","tag":"direct"}'
+  a_uuid="$(jq -r '.inbounds[] | select(.tag=="anytls-in") | .users[0].password // empty' "$cfg")"
+  a_port="$(jq -r '.inbounds[] | select(.tag=="anytls-in") | .listen_port // empty' "$cfg")"
+  cert="$(jq -r '.inbounds[] | select(.tag=="anytls-in") | .tls.certificate_path // "/etc/ssl/sbox/self.crt"' "$cfg")"
+  key="$(jq -r '.inbounds[] | select(.tag=="anytls-in") | .tls.key_path // "/etc/ssl/sbox/self.key"' "$cfg")"
+
+  [[ -z "$v_uuid" || -z "$a_uuid" ]] && return 0
+
+  local out_tag="direct" ob_json='{"type":"direct","tag":"direct"}'
   case "$mode" in
     psiphon)
       local socks
@@ -849,18 +916,42 @@ anytls_apply_mode() {
   cat > "$cfg" <<EOF
 {
   "log": {"level": "warn"},
-  "inbounds": [{
-    "type": "anytls",
-    "tag": "anytls-in",
-    "listen": "::",
-    "listen_port": ${port},
-    "users": [{"password": "${uuid}"}],
-    "tls": {
-      "enabled": true,
-      "certificate_path": "${cert}",
-      "key_path": "${key}"
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-in",
+      "listen": "::",
+      "listen_port": ${v_port},
+      "users": [{"uuid": "${v_uuid}", "flow": "xtls-rprx-vision"}],
+      "sniff": true,
+      "sniff_override_destination": true,
+      "tls": {
+        "enabled": true,
+        "server_name": "${r_sni}",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "${r_sni}",
+            "server_port": 443
+          },
+          "private_key": "${r_priv}",
+          "short_id": ["${r_sid}"]
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "anytls-in",
+      "listen": "::",
+      "listen_port": ${a_port},
+      "users": [{"password": "${a_uuid}"}],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "${cert}",
+        "key_path": "${key}"
+      }
     }
-  }],
+  ],
   "outbounds": [
     ${ob_json},
     {"type": "direct", "tag": "direct-out"}
@@ -872,9 +963,9 @@ anytls_apply_mode() {
 EOF
   systemctl restart sing-box 2>/dev/null || true
   if [[ "$mode" != "direct" ]]; then
-     grn "[+] AnyTLS 出口已切换至: $mode"
+     grn "[+] sing-box 出口已切换至: $mode"
   else
-     echo "[+] AnyTLS (sing-box) 配置已更新 (direct)"
+     echo "[+] sing-box 配置已更新 (direct)"
   fi
 }
 
@@ -1091,16 +1182,16 @@ case "${1:-}" in
     psictl country-test "${ALL[@]}"
     ;;
   restart)
-    systemctl restart psiphon xray hysteria2 tuic 2>/dev/null || true
+    systemctl restart psiphon sing-box hysteria2 tuic 2>/dev/null || true
     echo "[+] 已重启所有服务"
     ;;
   logs)
     case "${2:-}" in
       psi|psiphon) journalctl -u psiphon -n 100 --no-pager ;;
-      xray) journalctl -u xray -n 100 --no-pager ;;
+      sb|sing-box|xray) journalctl -u sing-box -n 100 --no-pager ;;
       hy2|hysteria) journalctl -u hysteria2 -n 100 --no-pager ;;
       tuic) journalctl -u tuic -n 100 --no-pager ;;
-      *) journalctl -u psiphon -u xray -u hysteria2 -u tuic -n 100 --no-pager ;;
+      *) journalctl -u psiphon -u sing-box -u hysteria2 -u tuic -n 100 --no-pager ;;
     esac
     ;;
   links)
@@ -1174,7 +1265,7 @@ case "${1:-}" in
     echo "  psictl smart-country        智能切换(先测试后选择)"
     echo "  psictl links                查看分享链接"
     echo "  psictl restart              重启所有服务"
-    echo "  psictl logs [psi|xray|hy2|tuic]"
+    echo "  psictl logs [psi|sb|sing-box|hy2|tuic]"
     ;;
 esac
 PSICTL_EOF
@@ -1437,31 +1528,9 @@ apply_proxy() {
     '.current_proxy = {"ip": $ip, "port": $port, "protocol": $proto}' "$CFG" > "$tmp"
   mv "$tmp" "$CFG"
   
-  # 更新 Xray 配置
-  if [[ -f /etc/xray/config.json ]]; then
-    local outbound
-    case "$protocol" in
-      socks5|socks4)
-        outbound='[{"protocol":"socks","tag":"freeproxy","settings":{"servers":[{"address":"'"$ip"'","port":'"$port"'}]}}]'
-        ;;
-      http|https)
-        outbound='[{"protocol":"http","tag":"freeproxy","settings":{"servers":[{"address":"'"$ip"'","port":'"$port"'}]}}]'
-        ;;
-    esac
-    
-    local routing
-    if [[ "$protocol" == "http" || "$protocol" == "https" ]]; then
-       routing='{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"freeproxy","network":"tcp"}]}'
-    else
-       routing='{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"freeproxy","network":"tcp,udp"}]}'
-    fi
-    tmp="$(mktemp)"
-    jq --argjson ob "$outbound" --argjson rt "$routing" \
-      '.outbounds=$ob | .routing=$rt' /etc/xray/config.json > "$tmp"
-    mv "$tmp" /etc/xray/config.json
-    
-    systemctl restart xray 2>/dev/null || true
-    grn "[+] Xray 配置已更新"
+  # 更新 sing-box 配置
+  if [[ -f /etc/sing-box/config.json ]]; then
+    anytls_apply_mode "freeproxy"
   fi
   
   # 更新 Hysteria2 配置
@@ -1658,14 +1727,9 @@ show_status() {
 disable_proxy() {
   write_cfg "enabled" "false"
   
-  # 恢复 Xray 直连
-  if [[ -f /etc/xray/config.json ]]; then
-    local tmp
-    tmp="$(mktemp)"
-    jq '.outbounds=[{"protocol":"freedom","tag":"direct","settings":{}}] | .routing={"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"direct","network":"tcp,udp"}]}' \
-      /etc/xray/config.json > "$tmp"
-    mv "$tmp" /etc/xray/config.json
-    systemctl restart xray 2>/dev/null || true
+  # 恢复 sing-box 直连
+  if [[ -f /etc/sing-box/config.json ]]; then
+    anytls_apply_mode "direct"
   fi
   
   # 恢复 Hysteria2
@@ -1683,11 +1747,6 @@ disable_proxy() {
     systemctl restart hysteria2 2>/dev/null || true
   fi
   
-  # 恢复 AnyTLS 直连
-  if [[ -f /etc/sing-box/config.json ]]; then
-    anytls_apply_mode "direct"
-  fi
-
   grn "[+] Free Proxy 已禁用，已恢复直连"
 }
 
@@ -1780,7 +1839,7 @@ install_menu(){
 #!/usr/bin/env bash
 set -euo pipefail
 
-SERVICES_IN=("xray" "hysteria2" "tuic" "sing-box")
+SERVICES_IN=("sing-box" "hysteria2" "tuic")
 SERVICE_PSI="psiphon"
 CLIENT_JSON="/etc/psiphon-egress/client.json"
 PSI_CFG="/etc/psiphon/psiphon.config"
@@ -1790,14 +1849,20 @@ anytls_apply_mode() {
   local cfg="/etc/sing-box/config.json"
   [[ -f "$cfg" ]] || return 0
 
-  # 从现有配置读取 UUID 和 证书路径
-  local uuid cert key port
-  uuid="$(jq -r '.inbounds[0].users[0].password // empty' "$cfg")"
-  cert="$(jq -r '.inbounds[0].tls.certificate_path // "/etc/ssl/sbox/self.crt"' "$cfg")"
-  key="$(jq -r '.inbounds[0].tls.key_path // "/etc/ssl/sbox/self.key"' "$cfg")"
-  port="$(jq -r '.inbounds[0].listen_port // 10443' "$cfg")"
-  
-  [[ -z "$uuid" || "$uuid" == "null" ]] && return 0
+  local v_uuid v_port r_sni r_priv r_sid
+  local a_uuid a_port cert key
+  v_uuid="$(jq -r '.inbounds[] | select(.tag=="vless-in") | .users[0].uuid // empty' "$cfg")"
+  v_port="$(jq -r '.inbounds[] | select(.tag=="vless-in") | .listen_port // empty' "$cfg")"
+  r_sni="$(jq -r '.inbounds[] | select(.tag=="vless-in") | .tls.server_name // empty' "$cfg")"
+  r_priv="$(jq -r '.inbounds[] | select(.tag=="vless-in") | .tls.reality.private_key // empty' "$cfg")"
+  r_sid="$(jq -r '.inbounds[] | select(.tag=="vless-in") | .tls.reality.short_id[0] // empty' "$cfg")"
+
+  a_uuid="$(jq -r '.inbounds[] | select(.tag=="anytls-in") | .users[0].password // empty' "$cfg")"
+  a_port="$(jq -r '.inbounds[] | select(.tag=="anytls-in") | .listen_port // empty' "$cfg")"
+  cert="$(jq -r '.inbounds[] | select(.tag=="anytls-in") | .tls.certificate_path // "/etc/ssl/sbox/self.crt"' "$cfg")"
+  key="$(jq -r '.inbounds[] | select(.tag=="anytls-in") | .tls.key_path // "/etc/ssl/sbox/self.key"' "$cfg")"
+
+  [[ -z "$v_uuid" || -z "$a_uuid" ]] && return 0
 
   local out_tag="direct" ob_json='{"type":"direct","tag":"direct"}'
   case "$mode" in
@@ -1827,18 +1892,42 @@ anytls_apply_mode() {
   cat > "$cfg" <<EOF
 {
   "log": {"level": "warn"},
-  "inbounds": [{
-    "type": "anytls",
-    "tag": "anytls-in",
-    "listen": "::",
-    "listen_port": ${port},
-    "users": [{"password": "${uuid}"}],
-    "tls": {
-      "enabled": true,
-      "certificate_path": "${cert}",
-      "key_path": "${key}"
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-in",
+      "listen": "::",
+      "listen_port": ${v_port},
+      "users": [{"uuid": "${v_uuid}", "flow": "xtls-rprx-vision"}],
+      "sniff": true,
+      "sniff_override_destination": true,
+      "tls": {
+        "enabled": true,
+        "server_name": "${r_sni}",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "${r_sni}",
+            "server_port": 443
+          },
+          "private_key": "${r_priv}",
+          "short_id": ["${r_sid}"]
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "anytls-in",
+      "listen": "::",
+      "listen_port": ${a_port},
+      "users": [{"password": "${a_uuid}"}],
+      "tls": {
+        "enabled": true,
+        "certificate_path": "${cert}",
+        "key_path": "${key}"
+      }
     }
-  }],
+  ],
   "outbounds": [
     ${ob_json},
     {"type": "direct", "tag": "direct-out"}
@@ -1850,9 +1939,9 @@ anytls_apply_mode() {
 EOF
   systemctl restart sing-box 2>/dev/null || true
   if [[ "$mode" != "direct" ]]; then
-     echo "[+] AnyTLS 出口已应用: $mode"
+     echo "[+] sing-box 出口已应用: $mode"
   else
-     echo "[+] AnyTLS (sing-box) 配置已更新 (direct)"
+     echo "[+] sing-box 配置已更新 (direct)"
   fi
 }
 
@@ -1998,20 +2087,19 @@ status_all() {
 }
 
 logs_menu() {
-  echo "可选：xray | hy2 | tuic | sb | psi | all"
+  echo "可选：sb | sing-box | hy2 | tuic | psi | all"
   read -r -p "选择(默认 all): " s
   s="${s:-all}"
   case "$s" in
-    xray) journalctl -u xray -n 200 --no-pager ;;
+    sb|sing-box|xray) journalctl -u sing-box -n 200 --no-pager ;;
     hy2|hysteria2) journalctl -u hysteria2 -n 200 --no-pager ;;
     tuic) journalctl -u tuic -n 200 --no-pager ;;
-    sb|anytls|sing-box) journalctl -u sing-box -n 200 --no-pager ;;
     psi|psiphon)
       if have_cmd psictl; then psictl logs psi; else journalctl -u psiphon -n 200 --no-pager; fi
       ;;
     all|"")
       if have_cmd psictl; then psictl logs; else
-        for u in xray hysteria2 tuic sing-box psiphon; do
+        for u in sing-box hysteria2 tuic psiphon; do
           echo -e "\n===== $u ====="
           journalctl -u "$u" -n 120 --no-pager 2>/dev/null || echo "$u 未运行"
         done
@@ -2104,61 +2192,8 @@ set_client_mode() {
 
 xray_apply_mode() {
   local mode="$1"
-  local socks
-  read -r socks _ < <(read_psi_ports)
-
-  local outbounds routing sniffing
-  sniffing='{"enabled":true,"destOverride":["http","tls"]}'
-
-  case "$mode" in
-    direct)
-      outbounds='[{"protocol":"freedom","tag":"direct","settings":{}}]'
-      routing='{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"direct","network":"tcp,udp"}]}'
-      ;;
-    psiphon)
-      # 全局 Psiphon: TCP+UDP 都走 Psiphon socks5
-      outbounds='[
-        {"protocol":"socks","tag":"psiphon","settings":{"servers":[{"address":"127.0.0.1","port":'"$socks"'}]}}
-      ]'
-      routing='{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"psiphon","network":"tcp,udp"}]}'
-      ;;
-    freeproxy)
-      local fp_cfg="/etc/freeproxy/config.json"
-      local fp_ip fp_port fp_proto
-      fp_ip="$(jq -r '.current_proxy.ip // empty' "$fp_cfg" 2>/dev/null || echo "")"
-      fp_port="$(jq -r '.current_proxy.port // empty' "$fp_cfg" 2>/dev/null || echo "")"
-      fp_proto="$(jq -r '.current_proxy.protocol // empty' "$fp_cfg" 2>/dev/null || echo "")"
-      if [[ -n "$fp_ip" ]]; then
-        if [[ "$fp_proto" == "http" || "$fp_proto" == "https" ]]; then
-          outbounds='[{"protocol":"http","tag":"freeproxy","settings":{"servers":[{"address":"'"$fp_ip"'","port":'"$fp_port"'}]}}]'
-          routing='{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"freeproxy","network":"tcp"}]}'
-        else
-          outbounds='[{"protocol":"socks","tag":"freeproxy","settings":{"servers":[{"address":"'"$fp_ip"'","port":'"$fp_port"'}]}}]'
-          routing='{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"freeproxy","network":"tcp,udp"}]}'
-        fi
-      else
-        # 无代理时 fallback 到直连
-        outbounds='[{"protocol":"freedom","tag":"direct","settings":{}}]'
-        routing='{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"direct","network":"tcp,udp"}]}'
-      fi
-      ;;
-    *)
-      echo "[-] 未知 mode: $mode"; return 1 ;;
-  esac
-
-  if [[ ! -f /etc/xray/config.json ]]; then
-    echo "[-] 未找到 /etc/xray/config.json，跳过 Xray 配置更新"
-    return 0
-  fi
-
-  local tmp
-  tmp="$(mktemp)"
-  jq --argjson ob "$outbounds" --argjson rt "$routing" --argjson sn "$sniffing" '
-    .outbounds=$ob
-    | .routing=$rt
-    | (.inbounds[] |= (.sniffing=$sn))
-  ' /etc/xray/config.json >"$tmp" && mv "$tmp" /etc/xray/config.json
-  echo "[+] Xray 配置已更新"
+  anytls_apply_mode "$mode"
+  echo "[+] sing-box 配置已更新"
 }
 
 hy2_apply_mode() {
@@ -2255,24 +2290,25 @@ rewrite_units_by_mode() {
     unit_wants="Wants=network-online.target"
   fi
 
-  if [[ -f /etc/systemd/system/xray.service ]]; then
-    cat > /etc/systemd/system/xray.service <<EOF
+  if [[ -f /etc/systemd/system/sing-box.service ]]; then
+    cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
-Description=Xray-core (VLESS+REALITY) Server
+Description=sing-box service (VLESS+REALITY + AnyTLS)
 ${unit_after}
 ${unit_wants}
 
 [Service]
-Type=simple
-ExecStart=/usr/local/bin/xray run -config /etc/xray/config.json
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
 Restart=always
-RestartSec=2
-LimitNOFILE=1048576
+RestartSec=5
+LimitNOFILE=infinity
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    echo "[+] xray.service 已更新"
+    echo "[+] sing-box.service 已更新"
   fi
 
   if [[ -f /etc/systemd/system/hysteria2.service ]]; then
@@ -2338,7 +2374,6 @@ switch_egress_mode() {
   set_client_mode "$mode"
   
   # 调用出口应用函数（所有模式都调，函数内自判）
-  xray_apply_mode "$mode"
   hy2_apply_mode "$mode"
   anytls_apply_mode "$mode"
   rewrite_units_by_mode "$mode"
@@ -2367,7 +2402,7 @@ switch_egress_mode() {
     echo "[*] psiphon.service 已启动"
   fi
 
-  systemctl restart xray hysteria2 sing-box 2>/dev/null || true
+  systemctl restart sing-box hysteria2 2>/dev/null || true
 
   echo ""
   echo "[+] 已切换为: $mode"
@@ -2683,11 +2718,11 @@ case "${1:-}" in
   logs)
     case "${2:-}" in
       psi|psiphon) journalctl -u psiphon -n 200 --no-pager ;;
-      xray) journalctl -u xray -n 200 --no-pager ;;
+      sb|sing-box|xray) journalctl -u sing-box -n 200 --no-pager ;;
       hy2|hysteria) journalctl -u hysteria2 -n 200 --no-pager ;;
       tuic) journalctl -u tuic -n 200 --no-pager ;;
       anytls|sing-box) journalctl -u sing-box -n 200 --no-pager ;;
-      *) journalctl -u psiphon -u xray -u hysteria2 -u tuic -u sing-box -n 200 --no-pager ;;
+      *) journalctl -u psiphon -u sing-box -u hysteria2 -u tuic -n 200 --no-pager ;;
     esac
     ;;
   links)
@@ -2799,12 +2834,12 @@ save_client_json(){
   "egress_mode": "${EGRESS_MODE}",
   "vless": {
     "port": ${VLESS_PORT},
-    "uuid": "${XRAY_UUID}",
+    "uuid": "${VLESS_UUID}",
     "flow": "xtls-rprx-vision",
     "sni": "${REALITY_SNI}",
     "fp": "chrome",
-    "pbk": "${XRAY_PUB}",
-    "sid": "${XRAY_SID}"
+    "pbk": "${REALITY_PUB}",
+    "sid": "${REALITY_SID}"
   },
   "hy2": {
     "port": ${HY2_PORT},
@@ -2843,7 +2878,7 @@ print_client_info(){
   [[ "$CERT_MODE" == "self" ]] && insecure=1
 
   # 生成分享链接（HY2/TUIC 使用伪装站点 SNI）
-  local vless_link="vless://${XRAY_UUID}@${HOST}:${VLESS_PORT}?encryption=none&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${XRAY_PUB}&sid=${XRAY_SID}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
+  local vless_link="vless://${VLESS_UUID}@${HOST}:${VLESS_PORT}?encryption=none&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
   local hy2_link="hysteria2://${HY2_PASS}@${HOST}:${HY2_PORT}/?obfs=salamander&obfs-password=${HY2_OBFS}&sni=${QUIC_SNI}&insecure=${insecure}&alpn=h3#HY2"
   local tuic_link=""
   if [[ -n "${TUIC_UUID:-}" ]]; then
@@ -2854,13 +2889,13 @@ print_client_info(){
 
 ==================== 客户端参数（请妥善保存）====================
 
-[VLESS + REALITY] (Xray)
+[VLESS + REALITY] (sing-box)
   地址: ${HOST}
   端口: ${VLESS_PORT} (TCP)
-  UUID: ${XRAY_UUID}
+  UUID: ${VLESS_UUID}
   SNI: ${REALITY_SNI}
-  pbk: ${XRAY_PUB}
-  sid: ${XRAY_SID}
+  pbk: ${REALITY_PUB}
+  sid: ${REALITY_SID}
 
 [Hysteria2]
   地址: ${HOST}
@@ -3005,7 +3040,7 @@ main(){
     PSIPHON_HTTP="8081"
   fi
 
-  ylw "[*] 请确保放行端口：${VLESS_PORT}/tcp, ${HY2_PORT}/udp, ${TUIC_PORT}/udp"
+  ylw "[*] 请确保放行端口：${VLESS_PORT}/tcp, ${HY2_PORT}/udp, ${TUIC_PORT}/udp, ${ANYTLS_PORT}/tcp"
   ylw "[*] 出站模式: ${EGRESS_MODE}"
 
   # psiphon 模式安装 Psiphon
@@ -3013,7 +3048,6 @@ main(){
     install_psiphon
   fi
 
-  install_xray_vless_reality
   install_hysteria2
   install_tuic_server
   install_sing_box_anytls

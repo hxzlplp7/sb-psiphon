@@ -2399,8 +2399,8 @@ hy2_apply_mode() {
   # 删除旧的 outbounds/acl 段，再按 mode 重新追加
   awk '
     BEGIN{skip=0}
-    /^outbounds:/{skip=1}
-    /^acl:/{skip=1}
+    /^(outbounds|acl):/{skip=1; next}
+    /^[a-z]/{skip=0}
     {if(!skip) print}
   ' "$f" >"$tmp"
 

@@ -15,6 +15,22 @@ DEFAULT_PSIPHON_SOCKS="1081"
 DEFAULT_PSIPHON_HTTP="8081"
 DEFAULT_EGRESS_MODE="direct"   # direct | psiphon | freeproxy
 
+# ========= 安装节点选择（默认全装） =========
+INSTALL_VLESS=1
+INSTALL_HY2=1
+INSTALL_TUIC=1
+INSTALL_ANYTLS=1
+
+# ========= 运行期变量默认值（避免 set -u 报错） =========
+VLESS_UUID=""
+REALITY_PRIV=""
+REALITY_PUB=""
+REALITY_SID=""
+HY2_PASS=""
+HY2_OBFS=""
+TUIC_UUID=""
+TUIC_PASS=""
+ANYTLS_UUID=""
 # ========= 全局临时目录管理（防止 set -u 报 unbound variable）=========
 _tmpd=""
 _cleanup_tmpd() {
@@ -159,12 +175,72 @@ prompt(){
   printf -v "$var" "%s" "$val"
 }
 
+choose_nodes(){
+  local sel
+  while true; do
+    echo ""
+    ylw "[*] 请选择要安装的节点组合（可多选，默认全装）"
+    echo "  1) VLESS+REALITY (sing-box)"
+    echo "  2) Hysteria2"
+    echo "  3) TUIC v5"
+    echo "  4) AnyTLS"
+    read -r -p "输入编号(如 1 2 4) 或关键词(vless,hy2,tuic,anytls) 或 all: " sel || true
+    sel="${sel,,}"
+    sel="${sel//,/ }"
+
+    if [[ -z "$sel" || "$sel" == "all" ]]; then
+      INSTALL_VLESS=1
+      INSTALL_HY2=1
+      INSTALL_TUIC=1
+      INSTALL_ANYTLS=1
+      break
+    fi
+
+    INSTALL_VLESS=0
+    INSTALL_HY2=0
+    INSTALL_TUIC=0
+    INSTALL_ANYTLS=0
+
+    for t in $sel; do
+      case "$t" in
+        1|vless|reality) INSTALL_VLESS=1 ;;
+        2|hy2|hysteria|hysteria2) INSTALL_HY2=1 ;;
+        3|tuic|tuic5|tuic-v5|tuicv5) INSTALL_TUIC=1 ;;
+        4|anytls|tls) INSTALL_ANYTLS=1 ;;
+        *) ;;
+      esac
+    done
+
+    if [[ "$INSTALL_VLESS$INSTALL_HY2$INSTALL_TUIC$INSTALL_ANYTLS" == "0000" ]]; then
+      red "[-] 未选择任何节点协议，请重新输入。"
+      continue
+    fi
+    break
+  done
+
+  local parts=()
+  [[ "$INSTALL_VLESS" == "1" ]] && parts+=("VLESS+REALITY")
+  [[ "$INSTALL_HY2" == "1" ]] && parts+=("Hysteria2")
+  [[ "$INSTALL_TUIC" == "1" ]] && parts+=("TUIC")
+  [[ "$INSTALL_ANYTLS" == "1" ]] && parts+=("AnyTLS")
+  grn "[+] 已选择安装: ${parts[*]}"
+}
+
 gen_uuid(){
   cat /proc/sys/kernel/random/uuid
 }
 
 rand_hex(){
   openssl rand -hex "$1"
+}
+
+ensure_self_cert(){
+  mkdir -p /etc/ssl/sbox
+  if [[ ! -f /etc/ssl/sbox/self.key ]]; then
+    openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+      -keyout /etc/ssl/sbox/self.key -out /etc/ssl/sbox/self.crt \
+      -subj "/CN=${HOST:-localhost}" >/dev/null 2>&1
+  fi
 }
 
 download_file(){
@@ -638,6 +714,7 @@ install_tuic_server(){
   fi
 
   mkdir -p /etc/tuic
+  ensure_self_cert
 
   cat > /etc/tuic/config.json <<EOF
 {
@@ -686,12 +763,12 @@ EOF
   TUIC_PASS="$tuic_pass"
 }
 
-# ========= sing-box (VLESS + REALITY + AnyTLS) =========
+# ========= sing-box (VLESS + REALITY / AnyTLS) =========
 install_sing_box_anytls(){
   local arch
   arch="$(detect_arch)"
 
-  ylw "[*] 安装 sing-box (VLESS+REALITY + AnyTLS)..."
+  ylw "[*] 安装 sing-box..."
 
   # 获取最新的 sing-box 版本 (1.12.0+)
   local latest_version url
@@ -750,41 +827,39 @@ install_sing_box_anytls(){
 
   mkdir -p /etc/sing-box
 
-  # 生成 VLESS + REALITY 参数
+  local parts=()
+  [[ "$INSTALL_VLESS" == "1" ]] && parts+=("VLESS+REALITY")
+  [[ "$INSTALL_ANYTLS" == "1" ]] && parts+=("AnyTLS")
+  local parts_str="${parts[*]}"
+  ylw "[*] sing-box 入站: ${parts_str}"
+
+  local inbounds_json=""
+
+  # VLESS + REALITY
   local vless_uuid keypair priv pub sid
-  vless_uuid="$(gen_uuid)"
-  keypair="$(/usr/local/bin/sing-box generate reality-keypair 2>/dev/null || true)"
-  if echo "$keypair" | jq -e . >/dev/null 2>&1; then
-    priv="$(echo "$keypair" | jq -r '.private_key // .privateKey // empty')"
-    pub="$(echo "$keypair" | jq -r '.public_key // .publicKey // empty')"
-  else
-    priv="$(echo "$keypair" | awk -F': *' '/^PrivateKey:/ {print $2; exit} /^Private key:/ {print $2; exit}')"
-    pub="$(echo "$keypair" | awk -F': *' '/^PublicKey:/ {print $2; exit} /^Public key:/ {print $2; exit}')"
-  fi
+  if [[ "$INSTALL_VLESS" == "1" ]]; then
+    vless_uuid="$(gen_uuid)"
+    keypair="$(/usr/local/bin/sing-box generate reality-keypair 2>/dev/null || true)"
+    if echo "$keypair" | jq -e . >/dev/null 2>&1; then
+      priv="$(echo "$keypair" | jq -r '.private_key // .privateKey // empty')"
+      pub="$(echo "$keypair" | jq -r '.public_key // .publicKey // empty')"
+    else
+      priv="$(echo "$keypair" | awk -F': *' '/^PrivateKey:/ {print $2; exit} /^Private key:/ {print $2; exit}')"
+      pub="$(echo "$keypair" | awk -F': *' '/^PublicKey:/ {print $2; exit} /^Public key:/ {print $2; exit}')"
+    fi
 
-  if [[ -z "$priv" || -z "$pub" || ${#priv} -lt 20 || ${#pub} -lt 20 ]]; then
-    red "[-] REALITY 密钥生成失败，请检查 sing-box 是否可用："
-    echo "$keypair"
-    return 1
-  fi
+    if [[ -z "$priv" || -z "$pub" || ${#priv} -lt 20 || ${#pub} -lt 20 ]]; then
+      red "[-] REALITY 密钥生成失败，请检查 sing-box 是否可用："
+      echo "$keypair"
+      return 1
+    fi
 
-  sid="$(rand_hex 8)"
+    sid="$(rand_hex 8)"
+    grn "[+] REALITY 密钥生成成功"
+    grn "    PrivateKey: ${priv:0:10}..."
+    grn "    PublicKey:  ${pub:0:10}..."
 
-  grn "[+] REALITY 密钥生成成功"
-  grn "    PrivateKey: ${priv:0:10}..."
-  grn "    PublicKey:  ${pub:0:10}..."
-
-  # AnyTLS 账号
-  local anytls_uuid cert_path key_path
-  anytls_uuid="$(gen_uuid)"
-  cert_path="/etc/ssl/sbox/self.crt"
-  key_path="/etc/ssl/sbox/self.key"
-
-  # 写入初始配置（默认直连）
-  cat > /etc/sing-box/config.json <<EOF
-{
-  "log": {"level": "warn"},
-  "inbounds": [
+    inbounds_json+=$(cat <<EOF
     {
       "type": "vless",
       "tag": "vless-in",
@@ -806,7 +881,21 @@ install_sing_box_anytls(){
           "short_id": ["${sid}"]
         }
       }
-    },
+    }
+EOF
+)
+  fi
+
+  # AnyTLS
+  local anytls_uuid cert_path key_path
+  if [[ "$INSTALL_ANYTLS" == "1" ]]; then
+    anytls_uuid="$(gen_uuid)"
+    cert_path="/etc/ssl/sbox/self.crt"
+    key_path="/etc/ssl/sbox/self.key"
+    ensure_self_cert
+
+    [[ -n "$inbounds_json" ]] && inbounds_json+=","
+    inbounds_json+=$(cat <<EOF
     {
       "type": "anytls",
       "tag": "anytls-in",
@@ -819,17 +908,32 @@ install_sing_box_anytls(){
         "key_path": "${key_path}"
       }
     }
+EOF
+)
+  fi
+
+  if [[ -z "$inbounds_json" ]]; then
+    red "[-] 未选择任何 sing-box 入站，跳过配置。"
+    return 1
+  fi
+
+  # 写入初始配置（默认直连）
+  cat > /etc/sing-box/config.json <<EOF
+{
+  "log": {"level": "warn"},
+  "inbounds": [
+${inbounds_json}
   ],
   "outbounds": [{"type": "direct", "tag": "direct"}]
 }
 EOF
 
   # 保存参数
-  VLESS_UUID="$vless_uuid"
-  REALITY_PRIV="$priv"
-  REALITY_PUB="$pub"
-  REALITY_SID="$sid"
-  ANYTLS_UUID="$anytls_uuid"
+  VLESS_UUID="${vless_uuid:-}"
+  REALITY_PRIV="${priv:-}"
+  REALITY_PUB="${pub:-}"
+  REALITY_SID="${sid:-}"
+  ANYTLS_UUID="${anytls_uuid:-}"
 
   # 应用初始出口模式
   anytls_apply_mode "$EGRESS_MODE"
@@ -846,7 +950,7 @@ EOF
 
   cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
-Description=sing-box service (VLESS+REALITY + AnyTLS)
+Description=sing-box service
 ${unit_after}
 ${unit_wants}
 
@@ -864,7 +968,7 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now sing-box
-  grn "[+] sing-box 已启动：VLESS+REALITY + AnyTLS"
+  grn "[+] sing-box 已启动：${parts_str}"
 }
 
 anytls_apply_mode() {
@@ -886,7 +990,9 @@ anytls_apply_mode() {
   cert="$(jq -r '.inbounds[] | select(.tag=="anytls-in") | .tls.certificate_path // "/etc/ssl/sbox/self.crt"' "$cfg")"
   key="$(jq -r '.inbounds[] | select(.tag=="anytls-in") | .tls.key_path // "/etc/ssl/sbox/self.key"' "$cfg")"
 
-  [[ -z "$v_uuid" || -z "$a_uuid" ]] && return 0
+  if [[ -z "$v_uuid" && -z "$a_uuid" ]]; then
+    return 0
+  fi
 
   local out_tag="direct" ob_json='{"type":"direct","tag":"direct"}'
   case "$mode" in
@@ -913,10 +1019,9 @@ anytls_apply_mode() {
       ;;
   esac
 
-  cat > "$cfg" <<EOF
-{
-  "log": {"level": "warn"},
-  "inbounds": [
+  local inbounds=""
+  if [[ -n "$v_uuid" ]]; then
+    inbounds+=$(cat <<EOF
     {
       "type": "vless",
       "tag": "vless-in",
@@ -938,7 +1043,14 @@ anytls_apply_mode() {
           "short_id": ["${r_sid}"]
         }
       }
-    },
+    }
+EOF
+)
+  fi
+
+  if [[ -n "$a_uuid" ]]; then
+    [[ -n "$inbounds" ]] && inbounds+=","
+    inbounds+=$(cat <<EOF
     {
       "type": "anytls",
       "tag": "anytls-in",
@@ -951,6 +1063,15 @@ anytls_apply_mode() {
         "key_path": "${key}"
       }
     }
+EOF
+)
+  fi
+
+  cat > "$cfg" <<EOF
+{
+  "log": {"level": "warn"},
+  "inbounds": [
+${inbounds}
   ],
   "outbounds": [
     ${ob_json},
@@ -1076,47 +1197,71 @@ show_links() {
   host="$(jq -r '.host' "$f")"
   cert_mode="$(jq -r '.cert_mode' "$f")"
 
+  local insecure
+  [[ "$cert_mode" == "self" ]] && insecure=1 || insecure=0
+
   # VLESS+REALITY
-  local v_port v_uuid v_sni v_pbk v_sid
-  v_port="$(jq -r '.vless.port' "$f")"
-  v_uuid="$(jq -r '.vless.uuid' "$f")"
-  v_sni="$(jq -r '.vless.sni' "$f")"
-  v_pbk="$(jq -r '.vless.pbk' "$f")"
-  v_sid="$(jq -r '.vless.sid' "$f")"
-  local vless_link="vless://${v_uuid}@${host}:${v_port}?encryption=none&security=reality&sni=${v_sni}&fp=chrome&pbk=${v_pbk}&sid=${v_sid}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
+  local v_port v_uuid v_sni v_pbk v_sid vless_link
+  v_port="$(jq -r '.vless.port // empty' "$f")"
+  v_uuid="$(jq -r '.vless.uuid // empty' "$f")"
+  v_sni="$(jq -r '.vless.sni // empty' "$f")"
+  v_pbk="$(jq -r '.vless.pbk // empty' "$f")"
+  v_sid="$(jq -r '.vless.sid // empty' "$f")"
+  vless_link="vless://${v_uuid}@${host}:${v_port}?encryption=none&security=reality&sni=${v_sni}&fp=chrome&pbk=${v_pbk}&sid=${v_sid}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
 
   # Hysteria2
-  local h_port h_auth h_obfs h_sni insecure
-  h_port="$(jq -r '.hy2.port' "$f")"
-  h_auth="$(jq -r '.hy2.auth' "$f")"
-  h_obfs="$(jq -r '.hy2.obfs_password' "$f")"
+  local h_port h_auth h_obfs h_sni hy2_link
+  h_port="$(jq -r '.hy2.port // empty' "$f")"
+  h_auth="$(jq -r '.hy2.auth // empty' "$f")"
+  h_obfs="$(jq -r '.hy2.obfs_password // empty' "$f")"
   h_sni="$(jq -r '.hy2.sni // "www.bing.com"' "$f")"
-  [[ "$cert_mode" == "self" ]] && insecure=1 || insecure=0
-  local hy2_link="hysteria2://${h_auth}@${host}:${h_port}/?obfs=salamander&obfs-password=${h_obfs}&sni=${h_sni}&insecure=${insecure}&alpn=h3#HY2"
+  hy2_link="hysteria2://${h_auth}@${host}:${h_port}/?obfs=salamander&obfs-password=${h_obfs}&sni=${h_sni}&insecure=${insecure}&alpn=h3#HY2"
 
   # TUIC
-  local t_port t_uuid t_pass t_sni
+  local t_port t_uuid t_pass t_sni tuic_link
   t_port="$(jq -r '.tuic.port // empty' "$f")"
   t_uuid="$(jq -r '.tuic.uuid // empty' "$f")"
   t_pass="$(jq -r '.tuic.password // empty' "$f")"
   t_sni="$(jq -r '.tuic.sni // "www.bing.com"' "$f")"
-  local tuic_link=""
-  if [[ -n "$t_uuid" && "$t_uuid" != "null" ]]; then
-    tuic_link="tuic://${t_uuid}:${t_pass}@${host}:${t_port}?alpn=h3&udp_relay_mode=native&congestion_control=bbr&sni=${t_sni}&allow_insecure=${insecure}#TUIC-v5"
-  fi
+  tuic_link="tuic://${t_uuid}:${t_pass}@${host}:${t_port}?alpn=h3&udp_relay_mode=native&congestion_control=bbr&sni=${t_sni}&allow_insecure=${insecure}#TUIC-v5"
+
+  # AnyTLS
+  local a_port a_pass a_sni anytls_link
+  a_port="$(jq -r '.anytls.port // empty' "$f")"
+  a_pass="$(jq -r '.anytls.password // empty' "$f")"
+  a_sni="$(jq -r '.anytls.sni // "www.bing.com"' "$f")"
+  anytls_link="anytls://${a_pass}@${host}:${a_port}?sni=${a_sni}&allowInsecure=${insecure}#AnyTLS"
 
   echo ""
   echo "==================== 分享链接 ===================="
-  echo ""
-  echo "[VLESS+REALITY]"
-  echo "$vless_link"
-  echo ""
-  echo "[Hysteria2]"
-  echo "$hy2_link"
-  if [[ -n "$tuic_link" ]]; then
+  local shown=0
+  if [[ -n "$v_uuid" && "$v_uuid" != "null" ]]; then
+    echo ""
+    echo "[VLESS+REALITY]"
+    echo "$vless_link"
+    shown=1
+  fi
+  if [[ -n "$h_auth" && "$h_auth" != "null" ]]; then
+    echo ""
+    echo "[Hysteria2]"
+    echo "$hy2_link"
+    shown=1
+  fi
+  if [[ -n "$t_uuid" && "$t_uuid" != "null" ]]; then
     echo ""
     echo "[TUIC v5]"
     echo "$tuic_link"
+    shown=1
+  fi
+  if [[ -n "$a_pass" && "$a_pass" != "null" ]]; then
+    echo ""
+    echo "[AnyTLS]"
+    echo "$anytls_link"
+    shown=1
+  fi
+  if [[ "$shown" -eq 0 ]]; then
+    echo ""
+    echo "[-] 未发现可用节点，请检查是否安装了对应协议。"
   fi
   echo ""
   echo "=================================================="
@@ -1862,7 +2007,9 @@ anytls_apply_mode() {
   cert="$(jq -r '.inbounds[] | select(.tag=="anytls-in") | .tls.certificate_path // "/etc/ssl/sbox/self.crt"' "$cfg")"
   key="$(jq -r '.inbounds[] | select(.tag=="anytls-in") | .tls.key_path // "/etc/ssl/sbox/self.key"' "$cfg")"
 
-  [[ -z "$v_uuid" || -z "$a_uuid" ]] && return 0
+  if [[ -z "$v_uuid" && -z "$a_uuid" ]]; then
+    return 0
+  fi
 
   local out_tag="direct" ob_json='{"type":"direct","tag":"direct"}'
   case "$mode" in
@@ -1889,10 +2036,9 @@ anytls_apply_mode() {
       ;;
   esac
 
-  cat > "$cfg" <<EOF
-{
-  "log": {"level": "warn"},
-  "inbounds": [
+  local inbounds=""
+  if [[ -n "$v_uuid" ]]; then
+    inbounds+=$(cat <<EOF
     {
       "type": "vless",
       "tag": "vless-in",
@@ -1914,7 +2060,13 @@ anytls_apply_mode() {
           "short_id": ["${r_sid}"]
         }
       }
-    },
+    }
+EOF
+)
+  fi
+  if [[ -n "$a_uuid" ]]; then
+    [[ -n "$inbounds" ]] && inbounds+=","
+    inbounds+=$(cat <<EOF
     {
       "type": "anytls",
       "tag": "anytls-in",
@@ -1927,6 +2079,15 @@ anytls_apply_mode() {
         "key_path": "${key}"
       }
     }
+EOF
+)
+  fi
+
+  cat > "$cfg" <<EOF
+{
+  "log": {"level": "warn"},
+  "inbounds": [
+${inbounds}
   ],
   "outbounds": [
     ${ob_json},
@@ -2020,16 +2181,16 @@ view_links() {
     [[ "$cert_mode" == "self" ]] && insecure=1 || insecure=0
 
     local v_port v_uuid v_sni v_pbk v_sid
-    v_port="$(jq -r '.vless.port' "$CLIENT_JSON")"
-    v_uuid="$(jq -r '.vless.uuid' "$CLIENT_JSON")"
-    v_sni="$(jq -r '.vless.sni' "$CLIENT_JSON")"
-    v_pbk="$(jq -r '.vless.pbk' "$CLIENT_JSON")"
-    v_sid="$(jq -r '.vless.sid' "$CLIENT_JSON")"
+    v_port="$(jq -r '.vless.port // empty' "$CLIENT_JSON")"
+    v_uuid="$(jq -r '.vless.uuid // empty' "$CLIENT_JSON")"
+    v_sni="$(jq -r '.vless.sni // empty' "$CLIENT_JSON")"
+    v_pbk="$(jq -r '.vless.pbk // empty' "$CLIENT_JSON")"
+    v_sid="$(jq -r '.vless.sid // empty' "$CLIENT_JSON")"
 
     local h_port h_auth h_obfs h_sni
-    h_port="$(jq -r '.hy2.port' "$CLIENT_JSON")"
-    h_auth="$(jq -r '.hy2.auth' "$CLIENT_JSON")"
-    h_obfs="$(jq -r '.hy2.obfs_password' "$CLIENT_JSON")"
+    h_port="$(jq -r '.hy2.port // empty' "$CLIENT_JSON")"
+    h_auth="$(jq -r '.hy2.auth // empty' "$CLIENT_JSON")"
+    h_obfs="$(jq -r '.hy2.obfs_password // empty' "$CLIENT_JSON")"
     h_sni="$(jq -r '.hy2.sni // "www.bing.com"' "$CLIENT_JSON")"
 
     local t_port t_uuid t_pass t_sni
@@ -2045,16 +2206,34 @@ view_links() {
 
     echo ""
     echo "==================== 分享链接 ===================="
-    echo ""
-    echo "[VLESS+REALITY]"
-    echo "vless://${v_uuid}@${host}:${v_port}?encryption=none&security=reality&sni=${v_sni}&fp=chrome&pbk=${v_pbk}&sid=${v_sid}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
-    echo ""
-    echo "[Hysteria2]"
-    echo "hysteria2://${h_auth}@${host}:${h_port}/?obfs=salamander&obfs-password=${h_obfs}&sni=${h_sni}&insecure=${insecure}&alpn=h3#HY2"
+    local shown=0
+    if [[ -n "$v_uuid" && "$v_uuid" != "null" ]]; then
+      echo ""
+      echo "[VLESS+REALITY]"
+      echo "vless://${v_uuid}@${host}:${v_port}?encryption=none&security=reality&sni=${v_sni}&fp=chrome&pbk=${v_pbk}&sid=${v_sid}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
+      shown=1
+    fi
+    if [[ -n "$h_auth" && "$h_auth" != "null" ]]; then
+      echo ""
+      echo "[Hysteria2]"
+      echo "hysteria2://${h_auth}@${host}:${h_port}/?obfs=salamander&obfs-password=${h_obfs}&sni=${h_sni}&insecure=${insecure}&alpn=h3#HY2"
+      shown=1
+    fi
     if [[ -n "$t_uuid" && "$t_uuid" != "null" ]]; then
       echo ""
       echo "[TUIC v5]"
       echo "tuic://${t_uuid}:${t_pass}@${host}:${t_port}?alpn=h3&udp_relay_mode=native&congestion_control=bbr&sni=${t_sni}&allow_insecure=${insecure}#TUIC-v5"
+      shown=1
+    fi
+    if [[ -n "$a_pass" && "$a_pass" != "null" ]]; then
+      echo ""
+      echo "[AnyTLS]"
+      echo "anytls://${a_pass}@${host}:${a_port}?sni=${a_sni}&allowInsecure=${insecure}#AnyTLS"
+      shown=1
+    fi
+    if [[ "$shown" -eq 0 ]]; then
+      echo ""
+      echo "[-] 未发现可用节点，请检查是否安装了对应协议。"
     fi
     echo ""
     echo "=================================================="
@@ -2293,7 +2472,7 @@ rewrite_units_by_mode() {
   if [[ -f /etc/systemd/system/sing-box.service ]]; then
     cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
-Description=sing-box service (VLESS+REALITY + AnyTLS)
+Description=sing-box service
 ${unit_after}
 ${unit_wants}
 
@@ -2733,23 +2912,35 @@ case "${1:-}" in
     insecure=0; [[ "$cert_mode" == "self" ]] && insecure=1
     echo ""
     echo "==================== 分享链接 ===================="
-    v_port="$(jq -r '.vless.port' "$f")"; v_uuid="$(jq -r '.vless.uuid' "$f")"; v_sni="$(jq -r '.vless.sni' "$f")"; v_pbk="$(jq -r '.vless.pbk' "$f")"; v_sid="$(jq -r '.vless.sid' "$f")"
-    echo "[VLESS+REALITY]"
-    echo "vless://${v_uuid}@${host}:${v_port}?encryption=none&security=reality&sni=${v_sni}&fp=chrome&pbk=${v_pbk}&sid=${v_sid}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
-    h_port="$(jq -r '.hy2.port' "$f")"; h_auth="$(jq -r '.hy2.auth' "$f")"; h_obfs="$(jq -r '.hy2.obfs_password' "$f")"; h_sni="$(jq -r '.hy2.sni // "www.bing.com"' "$f")"
-    echo "[Hysteria2]"
-    echo "hysteria2://${h_auth}@${host}:${h_port}/?obfs=salamander&obfs-password=${h_obfs}&sni=${h_sni}&insecure=${insecure}&alpn=h3#HY2"
+    shown=0
+    v_port="$(jq -r '.vless.port // empty' "$f")"; v_uuid="$(jq -r '.vless.uuid // empty' "$f")"; v_sni="$(jq -r '.vless.sni // empty' "$f")"; v_pbk="$(jq -r '.vless.pbk // empty' "$f")"; v_sid="$(jq -r '.vless.sid // empty' "$f")"
+    if [[ -n "$v_uuid" && "$v_uuid" != "null" ]]; then
+      echo "[VLESS+REALITY]"
+      echo "vless://${v_uuid}@${host}:${v_port}?encryption=none&security=reality&sni=${v_sni}&fp=chrome&pbk=${v_pbk}&sid=${v_sid}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
+      shown=1
+    fi
+    h_port="$(jq -r '.hy2.port // empty' "$f")"; h_auth="$(jq -r '.hy2.auth // empty' "$f")"; h_obfs="$(jq -r '.hy2.obfs_password // empty' "$f")"; h_sni="$(jq -r '.hy2.sni // "www.bing.com"' "$f")"
+    if [[ -n "$h_auth" && "$h_auth" != "null" ]]; then
+      echo "[Hysteria2]"
+      echo "hysteria2://${h_auth}@${host}:${h_port}/?obfs=salamander&obfs-password=${h_obfs}&sni=${h_sni}&insecure=${insecure}&alpn=h3#HY2"
+      shown=1
+    fi
     t_uuid="$(jq -r '.tuic.uuid // empty' "$f")"
     if [[ -n "$t_uuid" && "$t_uuid" != "null" ]]; then
-      t_port="$(jq -r '.tuic.port' "$f")"; t_pass="$(jq -r '.tuic.password' "$f")"; t_sni="$(jq -r '.tuic.sni // "www.bing.com"' "$f")"
+      t_port="$(jq -r '.tuic.port // empty' "$f")"; t_pass="$(jq -r '.tuic.password // empty' "$f")"; t_sni="$(jq -r '.tuic.sni // "www.bing.com"' "$f")"
       echo "[TUIC v5]"
       echo "tuic://${t_uuid}:${t_pass}@${host}:${t_port}?alpn=h3&udp_relay_mode=native&congestion_control=bbr&sni=${t_sni}&allow_insecure=${insecure}#TUIC-v5"
+      shown=1
     fi
     a_pass="$(jq -r '.anytls.password // empty' "$f")"
     if [[ -n "$a_pass" && "$a_pass" != "null" ]]; then
-      a_port="$(jq -r '.anytls.port' "$f")"; a_sni="$(jq -r '.anytls.sni // "www.bing.com"' "$f")"
+      a_port="$(jq -r '.anytls.port // empty' "$f")"; a_sni="$(jq -r '.anytls.sni // "www.bing.com"' "$f")"
       echo "[AnyTLS]"
       echo "anytls://${a_pass}@${host}:${a_port}?sni=${a_sni}&allowInsecure=${insecure}#AnyTLS"
+      shown=1
+    fi
+    if [[ "$shown" -eq 0 ]]; then
+      echo "[-] 未发现可用节点，请检查是否安装了对应协议。"
     fi
     echo "=================================================="
     ;;
@@ -2826,6 +3017,11 @@ save_client_json(){
   
   local insecure=0
   [[ "$CERT_MODE" == "self" ]] && insecure=1
+  local v_en h_en t_en a_en
+  [[ "$INSTALL_VLESS" == "1" ]] && v_en=true || v_en=false
+  [[ "$INSTALL_HY2" == "1" ]] && h_en=true || h_en=false
+  [[ "$INSTALL_TUIC" == "1" ]] && t_en=true || t_en=false
+  [[ "$INSTALL_ANYTLS" == "1" ]] && a_en=true || a_en=false
 
   cat >/etc/psiphon-egress/client.json <<EOF
 {
@@ -2833,6 +3029,7 @@ save_client_json(){
   "cert_mode": "${CERT_MODE}",
   "egress_mode": "${EGRESS_MODE}",
   "vless": {
+    "enabled": ${v_en},
     "port": ${VLESS_PORT},
     "uuid": "${VLESS_UUID}",
     "flow": "xtls-rprx-vision",
@@ -2842,6 +3039,7 @@ save_client_json(){
     "sid": "${REALITY_SID}"
   },
   "hy2": {
+    "enabled": ${h_en},
     "port": ${HY2_PORT},
     "auth": "${HY2_PASS}",
     "obfs": "salamander",
@@ -2850,6 +3048,7 @@ save_client_json(){
     "insecure": ${insecure}
   },
   "tuic": {
+    "enabled": ${t_en},
     "port": ${TUIC_PORT},
     "uuid": "${TUIC_UUID:-}",
     "password": "${TUIC_PASS:-}",
@@ -2859,6 +3058,7 @@ save_client_json(){
     "insecure": ${insecure}
   },
   "anytls": {
+    "enabled": ${a_en},
     "port": ${ANYTLS_PORT},
     "password": "${ANYTLS_UUID:-}",
     "sni": "${QUIC_SNI}",
@@ -2878,16 +3078,20 @@ print_client_info(){
   [[ "$CERT_MODE" == "self" ]] && insecure=1
 
   # 生成分享链接（HY2/TUIC 使用伪装站点 SNI）
-  local vless_link="vless://${VLESS_UUID}@${HOST}:${VLESS_PORT}?encryption=none&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
-  local hy2_link="hysteria2://${HY2_PASS}@${HOST}:${HY2_PORT}/?obfs=salamander&obfs-password=${HY2_OBFS}&sni=${QUIC_SNI}&insecure=${insecure}&alpn=h3#HY2"
-  local tuic_link=""
-  if [[ -n "${TUIC_UUID:-}" ]]; then
-    tuic_link="tuic://${TUIC_UUID}:${TUIC_PASS}@${HOST}:${TUIC_PORT}?alpn=h3&udp_relay_mode=native&congestion_control=bbr&sni=${QUIC_SNI}&allow_insecure=${insecure}#TUIC-v5"
-  fi
+  local vless_link="" hy2_link="" tuic_link="" anytls_link=""
+  [[ -n "${VLESS_UUID:-}" ]] && vless_link="vless://${VLESS_UUID}@${HOST}:${VLESS_PORT}?encryption=none&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
+  [[ -n "${HY2_PASS:-}" ]] && hy2_link="hysteria2://${HY2_PASS}@${HOST}:${HY2_PORT}/?obfs=salamander&obfs-password=${HY2_OBFS}&sni=${QUIC_SNI}&insecure=${insecure}&alpn=h3#HY2"
+  [[ -n "${TUIC_UUID:-}" ]] && tuic_link="tuic://${TUIC_UUID}:${TUIC_PASS}@${HOST}:${TUIC_PORT}?alpn=h3&udp_relay_mode=native&congestion_control=bbr&sni=${QUIC_SNI}&allow_insecure=${insecure}#TUIC-v5"
+  [[ -n "${ANYTLS_UUID:-}" ]] && anytls_link="anytls://${ANYTLS_UUID}@${HOST}:${ANYTLS_PORT}?sni=${QUIC_SNI}&allowInsecure=${insecure}#AnyTLS"
 
   cat <<EOF
 
 ==================== 客户端参数（请妥善保存）====================
+EOF
+
+  local shown=0
+  if [[ -n "${VLESS_UUID:-}" ]]; then
+    cat <<EOF
 
 [VLESS + REALITY] (sing-box)
   地址: ${HOST}
@@ -2896,58 +3100,87 @@ print_client_info(){
   SNI: ${REALITY_SNI}
   pbk: ${REALITY_PUB}
   sid: ${REALITY_SID}
+EOF
+    shown=1
+  fi
+
+  if [[ -n "${HY2_PASS:-}" ]]; then
+    cat <<EOF
 
 [Hysteria2]
   地址: ${HOST}
   端口: ${HY2_PORT} (UDP)
   密码: ${HY2_PASS}
   OBFS密码: ${HY2_OBFS}
-
 EOF
+    shown=1
+  fi
 
   if [[ -n "${TUIC_UUID:-}" ]]; then
     cat <<EOF
+
 [TUIC v5]
   地址: ${HOST}
   端口: ${TUIC_PORT} (UDP)
   UUID: ${TUIC_UUID}
   密码: ${TUIC_PASS}
-
 EOF
+    shown=1
   fi
 
-  cat <<EOF
-==================== 分享链接（可直接导入客户端）====================
-
-[VLESS+REALITY]
-${vless_link}
-
-[Hysteria2]
-${hy2_link}
-
-EOF
-
-  if [[ -n "$tuic_link" ]]; then
+  if [[ -n "${ANYTLS_UUID:-}" ]]; then
     cat <<EOF
-[TUIC v5]
-${tuic_link}
 
-EOF
-  fi
-
-  local anytls_link="anytls://${ANYTLS_UUID}@${HOST}:${ANYTLS_PORT}?sni=${QUIC_SNI}&allowInsecure=${insecure}#AnyTLS"
-  cat <<EOF
 [AnyTLS]
   地址: ${HOST}
   端口: ${ANYTLS_PORT} (TCP/TLS)
   密码: ${ANYTLS_UUID}
-
-[AnyTLS 分享链接]
-${anytls_link}
-
 EOF
+    shown=1
+  fi
+
+  if [[ "$shown" -eq 0 ]]; then
+    echo ""
+    echo "[-] 未安装任何入站协议"
+  fi
 
   cat <<EOF
+
+==================== 分享链接（可直接导入客户端）====================
+EOF
+
+  shown=0
+  if [[ -n "$vless_link" ]]; then
+    echo ""
+    echo "[VLESS+REALITY]"
+    echo "$vless_link"
+    shown=1
+  fi
+  if [[ -n "$hy2_link" ]]; then
+    echo ""
+    echo "[Hysteria2]"
+    echo "$hy2_link"
+    shown=1
+  fi
+  if [[ -n "$tuic_link" ]]; then
+    echo ""
+    echo "[TUIC v5]"
+    echo "$tuic_link"
+    shown=1
+  fi
+  if [[ -n "$anytls_link" ]]; then
+    echo ""
+    echo "[AnyTLS]"
+    echo "$anytls_link"
+    shown=1
+  fi
+  if [[ "$shown" -eq 0 ]]; then
+    echo ""
+    echo "[-] 未生成分享链接"
+  fi
+
+  cat <<EOF
+
 ===============================================================
 
 出站模式: ${EGRESS_MODE}
@@ -2992,6 +3225,7 @@ main(){
 
   install_deps
   check_memory
+  choose_nodes
 
   # 自动探测公网 IP（IPv4 优先）
   ylw "[*] 正在探测本机公网 IP (IPv4 优先)..."
@@ -3011,14 +3245,44 @@ main(){
     DEFAULT_HOST="example.com"
   fi
 
+  # 先设置默认值，避免未选择时变量未定义
+  VLESS_PORT="$DEFAULT_VLESS_PORT"
+  HY2_PORT="$DEFAULT_HY2_PORT"
+  TUIC_PORT="$DEFAULT_TUIC_PORT"
+  ANYTLS_PORT="$DEFAULT_ANYTLS_PORT"
+  REALITY_SNI="$DEFAULT_REALITY_SNI"
+  QUIC_SNI="$DEFAULT_QUIC_SNI"
+  CERT_MODE="$DEFAULT_CERT_MODE"
+
   prompt HOST "请输入用于客户端连接的域名或IP（HOST）" "$DEFAULT_HOST"
-  prompt VLESS_PORT "VLESS+REALITY 端口(TCP)" "$DEFAULT_VLESS_PORT"
-  prompt HY2_PORT "Hysteria2 端口(UDP)" "$DEFAULT_HY2_PORT"
-  prompt TUIC_PORT "TUIC v5 端口(UDP)" "$DEFAULT_TUIC_PORT"
-  prompt ANYTLS_PORT "AnyTLS 端口(TCP)" "$DEFAULT_ANYTLS_PORT"
-  prompt REALITY_SNI "REALITY 伪装站点(需TLS1.3/H2，示例 www.apple.com)" "$DEFAULT_REALITY_SNI"
-  prompt QUIC_SNI "HY2/TUIC 伪装站点SNI" "$DEFAULT_QUIC_SNI"
-  prompt CERT_MODE "HY2/TUIC TLS证书模式：le(自动申请) 或 self(自签)" "$DEFAULT_CERT_MODE"
+
+  if [[ "$INSTALL_VLESS" == "1" ]]; then
+    prompt VLESS_PORT "VLESS+REALITY 端口(TCP)" "$DEFAULT_VLESS_PORT"
+    prompt REALITY_SNI "REALITY 伪装站点(需TLS1.3/H2，示例 www.apple.com)" "$DEFAULT_REALITY_SNI"
+  fi
+  if [[ "$INSTALL_HY2" == "1" ]]; then
+    prompt HY2_PORT "Hysteria2 端口(UDP)" "$DEFAULT_HY2_PORT"
+  fi
+  if [[ "$INSTALL_TUIC" == "1" ]]; then
+    prompt TUIC_PORT "TUIC v5 端口(UDP)" "$DEFAULT_TUIC_PORT"
+  fi
+  if [[ "$INSTALL_ANYTLS" == "1" ]]; then
+    prompt ANYTLS_PORT "AnyTLS 端口(TCP)" "$DEFAULT_ANYTLS_PORT"
+  fi
+
+  if [[ "$INSTALL_HY2" == "1" || "$INSTALL_TUIC" == "1" || "$INSTALL_ANYTLS" == "1" ]]; then
+    prompt QUIC_SNI "HY2/TUIC/AnyTLS 伪装站点SNI" "$DEFAULT_QUIC_SNI"
+  fi
+  if [[ "$INSTALL_HY2" == "1" ]]; then
+    prompt CERT_MODE "HY2 TLS证书模式：le(自动申请) 或 self(自签)" "$DEFAULT_CERT_MODE"
+  else
+    CERT_MODE="self"
+  fi
+  CERT_MODE="${CERT_MODE,,}"
+  if [[ ! "$CERT_MODE" =~ ^(self|le)$ ]]; then
+    ylw "[!] 无效的证书模式，使用默认值: ${DEFAULT_CERT_MODE}"
+    CERT_MODE="$DEFAULT_CERT_MODE"
+  fi
 
   # 出站模式选择
   prompt EGRESS_MODE "出站模式: direct(直连) psiphon(全走Psiphon) freeproxy(免费代理)" "$DEFAULT_EGRESS_MODE"
@@ -3040,7 +3304,39 @@ main(){
     PSIPHON_HTTP="8081"
   fi
 
-  ylw "[*] 请确保放行端口：${VLESS_PORT}/tcp, ${HY2_PORT}/udp, ${TUIC_PORT}/udp, ${ANYTLS_PORT}/tcp"
+  # 未选择的协议清空关键参数，避免残留
+  if [[ "$INSTALL_VLESS" != "1" ]]; then
+    VLESS_PORT=0
+    REALITY_SNI=""
+    VLESS_UUID=""
+    REALITY_PUB=""
+    REALITY_SID=""
+  fi
+  if [[ "$INSTALL_HY2" != "1" ]]; then
+    HY2_PORT=0
+    HY2_PASS=""
+    HY2_OBFS=""
+  fi
+  if [[ "$INSTALL_TUIC" != "1" ]]; then
+    TUIC_PORT=0
+    TUIC_UUID=""
+    TUIC_PASS=""
+  fi
+  if [[ "$INSTALL_ANYTLS" != "1" ]]; then
+    ANYTLS_PORT=0
+    ANYTLS_UUID=""
+  fi
+
+  local ports=()
+  [[ "$INSTALL_VLESS" == "1" ]] && ports+=("${VLESS_PORT}/tcp")
+  [[ "$INSTALL_HY2" == "1" ]] && ports+=("${HY2_PORT}/udp")
+  [[ "$INSTALL_TUIC" == "1" ]] && ports+=("${TUIC_PORT}/udp")
+  [[ "$INSTALL_ANYTLS" == "1" ]] && ports+=("${ANYTLS_PORT}/tcp")
+  if [[ "${#ports[@]}" -gt 0 ]]; then
+    local ports_str
+    ports_str="$(IFS=', '; echo "${ports[*]}")"
+    ylw "[*] 请确保放行端口：${ports_str}"
+  fi
   ylw "[*] 出站模式: ${EGRESS_MODE}"
 
   # psiphon 模式安装 Psiphon
@@ -3048,9 +3344,11 @@ main(){
     install_psiphon
   fi
 
-  install_hysteria2
-  install_tuic_server
-  install_sing_box_anytls
+  [[ "$INSTALL_HY2" == "1" ]] && install_hysteria2
+  [[ "$INSTALL_TUIC" == "1" ]] && install_tuic_server
+  if [[ "$INSTALL_VLESS" == "1" || "$INSTALL_ANYTLS" == "1" ]]; then
+    install_sing_box_anytls
+  fi
 
   # 始终安装 psictl 和 proxyctl 以便菜单使用
   install_psictl

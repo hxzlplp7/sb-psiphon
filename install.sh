@@ -243,6 +243,17 @@ ensure_self_cert(){
   fi
 }
 
+is_ip(){
+  local h="$1"
+  if [[ "$h" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    return 0
+  fi
+  if [[ "$h" == *:* ]]; then
+    return 0
+  fi
+  return 1
+}
+
 download_file(){
   local url="$1" dest="$2"
   local tmp="/tmp/download_$(rand_hex 4)"
@@ -3282,6 +3293,18 @@ main(){
   if [[ ! "$CERT_MODE" =~ ^(self|le)$ ]]; then
     ylw "[!] 无效的证书模式，使用默认值: ${DEFAULT_CERT_MODE}"
     CERT_MODE="$DEFAULT_CERT_MODE"
+  fi
+
+  if [[ "$CERT_MODE" == "le" ]]; then
+    if is_ip "$HOST"; then
+      ylw "[!] 检测到 HOST 为 IP，LE 证书无法签发，已自动切换为 self"
+      CERT_MODE="self"
+    else
+      if [[ "$QUIC_SNI" != "$HOST" ]]; then
+        ylw "[*] LE 模式下 SNI 需与证书域名一致，已设置为 HOST: ${HOST}"
+        QUIC_SNI="$HOST"
+      fi
+    fi
   fi
 
   # 出站模式选择

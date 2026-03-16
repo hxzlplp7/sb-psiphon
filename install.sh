@@ -31,6 +31,8 @@ HY2_OBFS=""
 TUIC_UUID=""
 TUIC_PASS=""
 ANYTLS_UUID=""
+HY2_HOP_START=""
+HY2_HOP_END=""
 # ========= 全局临时目录管理（防止 set -u 报 unbound variable）=========
 _tmpd=""
 _cleanup_tmpd() {
@@ -129,9 +131,9 @@ install_deps(){
   ylw "[*] 安装依赖..."
   if [[ "$pm" == "apt" ]]; then
     apt-get update -y
-    apt-get install -y curl wget jq unzip openssl ca-certificates socat cron
+    apt-get install -y curl wget jq unzip openssl ca-certificates socat cron iptables-persistent netfilter-persistent
   else
-    "$pm" -y install curl wget jq unzip openssl ca-certificates socat cronie || true
+    "$pm" -y install curl wget jq unzip openssl ca-certificates socat cronie iptables || true
     systemctl enable --now crond >/dev/null 2>&1 || true
   fi
   grn "[+] 依赖安装完成"
@@ -602,6 +604,16 @@ tls:
 auth:
   type: password
   password: ${hy_pass}
+quic:
+  initStreamReceiveWindow: 16777216
+  maxStreamReceiveWindow: 16777216
+  initConnReceiveWindow: 33554432
+  maxConnReceiveWindow: 33554432
+masquerade:
+  type: proxy
+  proxy:
+    url: https://maimai.sega.jp
+    rewriteHost: true
 EOF
   else
     # 自签证书模式 - 基础配置
@@ -614,7 +626,28 @@ tls:
 auth:
   type: password
   password: ${hy_pass}
+quic:
+  initStreamReceiveWindow: 16777216
+  maxStreamReceiveWindow: 16777216
+  initConnReceiveWindow: 33554432
+  maxConnReceiveWindow: 33554432
+masquerade:
+  type: proxy
+  proxy:
+    url: https://maimai.sega.jp
+    rewriteHost: true
 EOF
+  fi
+
+  # 检查是否为 NAT 环境且开启端口跳跃
+  if [[ -n "${HY2_HOP_START:-}" && -n "${HY2_HOP_END:-}" ]]; then
+    ylw "[*] 正在配置 Hysteria2 端口跳跃: ${HY2_HOP_START}-${HY2_HOP_END} -> ${HY2_PORT}"
+    iptables -t nat -F PREROUTING >/dev/null 2>&1 || true
+    iptables -t nat -A PREROUTING -p udp --dport "${HY2_HOP_START}:${HY2_HOP_END}" -j DNAT --to-destination ":${HY2_PORT}"
+    ip6tables -t nat -A PREROUTING -p udp --dport "${HY2_HOP_START}:${HY2_HOP_END}" -j DNAT --to-destination ":${HY2_PORT}"
+    if have_cmd netfilter-persistent; then
+      netfilter-persistent save >/dev/null 2>&1 || true
+    fi
   fi
 
   # 根据出站模式追加 outbounds 和 ACL 配置
@@ -1212,11 +1245,18 @@ show_links() {
   vless_link="vless://${v_uuid}@${host}:${v_port}?encryption=none&security=reality&sni=${v_sni}&fp=chrome&pbk=${v_pbk}&sid=${v_sid}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
 
   # Hysteria2
-  local h_port h_auth h_sni hy2_link
+  local h_port h_auth h_sni h_hop_s h_hop_e hy2_link h_last_port
   h_port="$(jq -r '.hy2.port // empty' "$f")"
   h_auth="$(jq -r '.hy2.auth // empty' "$f")"
   h_sni="$(jq -r '.hy2.sni // "www.bing.com"' "$f")"
-  hy2_link="hysteria2://${h_auth}@${host}:${h_port}/?sni=${h_sni}&insecure=${insecure}&alpn=h3#HY2"
+  h_hop_s="$(jq -r '.hy2.hop_start // empty' "$f")"
+  h_hop_e="$(jq -r '.hy2.hop_end // empty' "$f")"
+  if [[ -n "$h_hop_s" ]]; then
+    h_last_port="${h_port},${h_hop_s}-${h_hop_e}"
+  else
+    h_last_port="$h_port"
+  fi
+  hy2_link="hysteria2://${h_auth}@${host}:${h_last_port}/?sni=${h_sni}&insecure=${insecure}#HY2"
 
   # TUIC
   local t_port t_uuid t_pass t_sni tuic_link
@@ -2188,10 +2228,17 @@ view_links() {
     v_pbk="$(jq -r '.vless.pbk // empty' "$CLIENT_JSON")"
     v_sid="$(jq -r '.vless.sid // empty' "$CLIENT_JSON")"
 
-    local h_port h_auth h_sni
+    local h_port h_auth h_sni h_hop_s h_hop_e h_last_port
     h_port="$(jq -r '.hy2.port // empty' "$CLIENT_JSON")"
     h_auth="$(jq -r '.hy2.auth // empty' "$CLIENT_JSON")"
     h_sni="$(jq -r '.hy2.sni // "www.bing.com"' "$CLIENT_JSON")"
+    h_hop_s="$(jq -r '.hy2.hop_start // empty' "$CLIENT_JSON")"
+    h_hop_e="$(jq -r '.hy2.hop_end // empty' "$CLIENT_JSON")"
+    if [[ -n "$h_hop_s" && "$h_hop_s" != "null" ]]; then
+       h_last_port="${h_port},${h_hop_s}-${h_hop_e}"
+    else
+       h_last_port="$h_port"
+    fi
 
     local t_port t_uuid t_pass t_sni
     t_port="$(jq -r '.tuic.port // empty' "$CLIENT_JSON")"
@@ -2216,7 +2263,7 @@ view_links() {
     if [[ -n "$h_auth" && "$h_auth" != "null" ]]; then
       echo ""
       echo "[Hysteria2]"
-      echo "hysteria2://${h_auth}@${host}:${h_port}/?sni=${h_sni}&insecure=${insecure}&alpn=h3#HY2"
+      echo "hysteria2://${h_auth}@${host}:${h_last_port}/?sni=${h_sni}&insecure=${insecure}#HY2"
       shown=1
     fi
     if [[ -n "$t_uuid" && "$t_uuid" != "null" ]]; then
@@ -2920,9 +2967,12 @@ case "${1:-}" in
       shown=1
     fi
     h_port="$(jq -r '.hy2.port // empty' "$f")"; h_auth="$(jq -r '.hy2.auth // empty' "$f")"; h_sni="$(jq -r '.hy2.sni // "www.bing.com"' "$f")"
+    h_hop_s="$(jq -r '.hy2.hop_start // empty' "$f")"
+    h_hop_e="$(jq -r '.hy2.hop_end // empty' "$f")"
+    if [[ -n "$h_hop_s" && "$h_hop_s" != "null" ]]; then h_last_port="${h_port},${h_hop_s}-${h_hop_e}"; else h_last_port="$h_port"; fi
     if [[ -n "$h_auth" && "$h_auth" != "null" ]]; then
       echo "[Hysteria2]"
-      echo "hysteria2://${h_auth}@${host}:${h_port}/?sni=${h_sni}&insecure=${insecure}&alpn=h3#HY2"
+      echo "hysteria2://${h_auth}@${host}:${h_last_port}/?sni=${h_sni}&insecure=${insecure}#HY2"
       shown=1
     fi
     t_uuid="$(jq -r '.tuic.uuid // empty' "$f")"
@@ -3041,6 +3091,8 @@ save_client_json(){
   "hy2": {
     "enabled": ${h_en},
     "port": ${HY2_PORT},
+    "hop_start": "${HY2_HOP_START:-}",
+    "hop_end": "${HY2_HOP_END:-}",
     "auth": "${HY2_PASS}",
     "obfs": "",
     "obfs_password": "",
@@ -3079,8 +3131,11 @@ print_client_info(){
 
   # 生成分享链接（HY2/TUIC 使用伪装站点 SNI）
   local vless_link="" hy2_link="" tuic_link="" anytls_link=""
+  local h_lp="${HY2_PORT}"
+  if [[ -n "${HY2_HOP_START:-}" ]]; then h_lp="${HY2_PORT},${HY2_HOP_START}-${HY2_HOP_END}"; fi
+
   [[ -n "${VLESS_UUID:-}" ]] && vless_link="vless://${VLESS_UUID}@${HOST}:${VLESS_PORT}?encryption=none&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp&flow=xtls-rprx-vision#VLESS-Reality"
-  [[ -n "${HY2_PASS:-}" ]] && hy2_link="hysteria2://${HY2_PASS}@${HOST}:${HY2_PORT}/?sni=${QUIC_SNI}&insecure=${insecure}&alpn=h3#HY2"
+  [[ -n "${HY2_PASS:-}" ]] && hy2_link="hysteria2://${HY2_PASS}@${HOST}:${h_lp}/?sni=${QUIC_SNI}&insecure=${insecure}#HY2"
   [[ -n "${TUIC_UUID:-}" ]] && tuic_link="tuic://${TUIC_UUID}:${TUIC_PASS}@${HOST}:${TUIC_PORT}?alpn=h3&udp_relay_mode=native&congestion_control=bbr&sni=${QUIC_SNI}&allow_insecure=${insecure}#TUIC-v5"
   [[ -n "${ANYTLS_UUID:-}" ]] && anytls_link="anytls://${ANYTLS_UUID}@${HOST}:${ANYTLS_PORT}?sni=${QUIC_SNI}&allowInsecure=${insecure}#AnyTLS"
 
@@ -3261,6 +3316,13 @@ main(){
   fi
   if [[ "$INSTALL_HY2" == "1" ]]; then
     prompt HY2_PORT "Hysteria2 端口(UDP)" "$DEFAULT_HY2_PORT"
+    echo ""
+    ylw "[*] 端口跳跃 (Port Hopping) 能有效对抗 QOS。是否开启？(y/n)"
+    read -r -p "选择 (默认 n): " hop_yn
+    if [[ "${hop_yn,,}" == "y" ]]; then
+      prompt HY2_HOP_START "端口跳跃-起始端口" "20000"
+      prompt HY2_HOP_END "端口跳跃-结束端口" "30000"
+    fi
   fi
   if [[ "$INSTALL_TUIC" == "1" ]]; then
     prompt TUIC_PORT "TUIC v5 端口(UDP)" "$DEFAULT_TUIC_PORT"
@@ -3327,6 +3389,8 @@ main(){
     HY2_PORT=0
     HY2_PASS=""
     HY2_OBFS=""
+    HY2_HOP_START=""
+    HY2_HOP_END=""
   fi
   if [[ "$INSTALL_TUIC" != "1" ]]; then
     TUIC_PORT=0
@@ -3340,7 +3404,13 @@ main(){
 
   local ports=()
   [[ "$INSTALL_VLESS" == "1" ]] && ports+=("${VLESS_PORT}/tcp")
-  [[ "$INSTALL_HY2" == "1" ]] && ports+=("${HY2_PORT}/udp")
+  if [[ "$INSTALL_HY2" == "1" ]]; then
+    if [[ -n "$HY2_HOP_START" ]]; then
+       ports+=("${HY2_PORT}/udp" "${HY2_HOP_START}-${HY2_HOP_END}/udp")
+    else
+       ports+=("${HY2_PORT}/udp")
+    fi
+  fi
   [[ "$INSTALL_TUIC" == "1" ]] && ports+=("${TUIC_PORT}/udp")
   [[ "$INSTALL_ANYTLS" == "1" ]] && ports+=("${ANYTLS_PORT}/tcp")
   if [[ "${#ports[@]}" -gt 0 ]]; then

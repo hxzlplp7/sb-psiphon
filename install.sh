@@ -8,6 +8,7 @@ DEFAULT_HY2_PORT="8443"
 DEFAULT_TUIC_PORT="2053"
 DEFAULT_REALITY_SNI="www.apple.com"
 DEFAULT_QUIC_SNI="www.bing.com"    
+DEFAULT_ANYTLS_PORT="10443"
 DEFAULT_CERT_MODE="self"   # self | le
 DEFAULT_PSIPHON_REGION="US"
 DEFAULT_PSIPHON_SOCKS="1081"
@@ -58,18 +59,29 @@ ensure_downloader(){
   grn "[+] curl/wget 已安装"
 }
 
+# ==================== 辅助函数 ====================
+read_psi_ports() {
+  local PSI_CFG="/etc/psiphon/psiphon.config"
+  local socks http
+  socks="$(jq -r '.LocalSocksProxyPort // 1081' "$PSI_CFG" 2>/dev/null || echo 1081)"
+  http="$(jq -r '.LocalHttpProxyPort // 8081' "$PSI_CFG" 2>/dev/null || echo 8081)"
+  echo "$socks $http"
+}
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+is_root() { [[ ${EUID:-$(id -u)} -eq 0 ]]; }
+pause() { read -r -p $'\n回车继续...' _; }
+
 # 入口点
 need_root
 ensure_downloader
 
-# 检测 OS 类型（用于 Psiphon 二进制选择）
 detect_os(){
   local os
   os="$(uname -s | tr '[:upper:]' '[:lower:]')"
   case "$os" in
-    linux)   echo "linux" ;;
-    freebsd) echo "freebsd" ;;
-    *)       echo "unsupported" ;;
+    linux) echo "linux" ;;
+    *)     echo "unsupported" ;;
   esac
 }
 
@@ -91,7 +103,7 @@ detect_pm(){
   if command -v apt-get >/dev/null 2>&1; then echo "apt"; return; fi
   if command -v dnf >/dev/null 2>&1; then echo "dnf"; return; fi
   if command -v yum >/dev/null 2>&1; then echo "yum"; return; fi
-  red "不支持的系统：找不到 apt/dnf/yum"
+  red "[-] 错误：找不到支持的包管理器 (apt/dnf/yum)。本脚本目前仅支持 Debian/Ubuntu/CentOS/Fedora/Rocky/Alma 等 Linux 发行版。"
   exit 1
 }
 
@@ -132,15 +144,18 @@ rand_hex(){
 
 download_file(){
   local url="$1" dest="$2"
-  # 先下载到 /tmp，避免直接写 /usr/local/bin 导致 curl 23 错误
-  local tmp
-  tmp="$(mktemp -p /tmp download.XXXXXX)"
+  local tmp="/tmp/download_$(rand_hex 4)"
+  ylw "[*] 正在下载: $url"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --retry 3 "$url" -o "$tmp"
+    curl -fsSL --retry 3 --max-time 60 "$url" -o "$tmp" || { red "[-] 下载失败: $url"; return 1; }
   else
-    wget -qO "$tmp" "$url"
+    wget -qO "$tmp" "$url" --timeout=60 || { red "[-] 下载失败: $url"; return 1; }
   fi
-  # 使用 install 命令移动到目标位置
+  if [[ ! -s "$tmp" ]]; then
+    red "[-] 下载的文件为空: $url"
+    rm -f "$tmp"
+    return 1
+  fi
   install -m 0755 "$tmp" "$dest"
   rm -f "$tmp"
 }
@@ -148,15 +163,11 @@ download_file(){
 download_latest_github_release_asset(){
   local repo="$1" regex="$2"
   local api="https://api.github.com/repos/${repo}/releases/latest"
-  local url
+  local url=""
   if command -v curl >/dev/null 2>&1; then
-    url="$(curl -fsSL "$api" | jq -r ".assets[].browser_download_url" | grep -E "$regex" | head -n1 || true)"
+    url="$(curl -fsSL --max-time 10 "$api" 2>/dev/null | jq -r ".assets[].browser_download_url" 2>/dev/null | grep -E "$regex" | head -n1 || true)"
   else
-    url="$(wget -qO- "$api" | jq -r ".assets[].browser_download_url" | grep -E "$regex" | head -n1 || true)"
-  fi
-  if [[ -z "$url" ]]; then
-    red "找不到 ${repo} 的 release 资源：$regex"
-    exit 1
+    url="$(wget -qO- --timeout=10 "$api" 2>/dev/null | jq -r ".assets[].browser_download_url" 2>/dev/null | grep -E "$regex" | head -n1 || true)"
   fi
   echo "$url"
 }
@@ -170,123 +181,52 @@ PSI_OFFICIAL_FALLBACK_LINUX_AMD64="https://raw.githubusercontent.com/Psiphon-Lab
 
 install_psiphon(){
   local os arch
-  os="$(detect_os)"
+  os="linux"
   arch="$(detect_arch)"
 
   ylw "[*] 安装 Psiphon ConsoleClient..."
-  ylw "[*] 检测到平台: ${os}/${arch}"
   mkdir -p /etc/psiphon /var/lib/psiphon /usr/local/bin
 
-  if [[ "$os" == "unsupported" ]]; then
-    red "[!] 不支持的操作系统: $(uname -s)"
-    red "    目前仅支持 Linux 和 FreeBSD"
-    exit 1
-  fi
-
-  if [[ "$arch" == "unknown" ]]; then
-    red "[!] 不支持的架构: $(uname -m)"
-    exit 1
-  fi
-
-  # 创建临时目录（使用全局 _tmpd，由 EXIT trap 清理）
   _tmpd="$(mktemp -d)"
-
   local tag="${PSI_TAG_DEFAULT}"
   local base="https://github.com/${PSI_REPO_OWNER}/${PSI_REPO_NAME}/releases/download/${tag}"
   local asset="psiphon-tunnel-core-${os}-${arch}.tar.gz"
   local url="${base}/${asset}"
-  local sha_url="${url}.sha256"
-
-  ylw "[*] 尝试从 hxzlplp7 releases 下载: ${url}"
-
+  
   local download_success=false
-
-  # 检查 release 资产是否存在
-  if curl -fsI "$url" >/dev/null 2>&1; then
-    # 下载 tar.gz
-    ylw "[*] 正在下载..."
-    if command -v curl >/dev/null 2>&1; then
-      curl -fsSL "$url" -o "${_tmpd}/${asset}"
-    else
-      wget -qO "${_tmpd}/${asset}" "$url"
-    fi
-
-    # 尝试下载并校验 SHA256
-    if curl -fsI "$sha_url" >/dev/null 2>&1; then
-      ylw "[*] 下载 SHA256 校验文件..."
-      if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$sha_url" -o "${_tmpd}/${asset}.sha256"
-      else
-        wget -qO "${_tmpd}/${asset}.sha256" "$sha_url"
-      fi
-
-      local expected actual
-      expected="$(grep -Eo '[0-9a-fA-F]{64}' "${_tmpd}/${asset}.sha256" | head -n1 | tr '[:upper:]' '[:lower:]')"
-
-      # 计算实际 SHA256（兼容 Linux 和 FreeBSD）
-      if command -v sha256sum >/dev/null 2>&1; then
-        actual="$(sha256sum "${_tmpd}/${asset}" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
-      elif command -v shasum >/dev/null 2>&1; then
-        actual="$(shasum -a 256 "${_tmpd}/${asset}" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
-      else
-        ylw "[!] 未找到 sha256sum/shasum，跳过校验"
-        expected=""
-      fi
-
-      if [[ -n "$expected" && "$expected" != "$actual" ]]; then
-        red "[!] SHA256 校验失败!"
-        red "    期望: ${expected}"
-        red "    实际: ${actual}"
-        exit 1
-      fi
-
-      if [[ -n "$expected" ]]; then
-        grn "[+] SHA256 校验通过"
-      fi
-    else
-      ylw "[!] 未找到 SHA256 文件，跳过校验（建议 releases 一定带 .sha256）"
-    fi
-
-    # 解压
-    ylw "[*] 解压中..."
-    tar -xzf "${_tmpd}/${asset}" -C "$_tmpd"
-
-    # 查找解压后的二进制文件
-    local extracted=""
-    if [[ -f "${_tmpd}/psiphon-tunnel-core" ]]; then
-      extracted="${_tmpd}/psiphon-tunnel-core"
-    else
-      # 兼容 tar 包里二进制名不固定的情况
-      extracted="$(find "$_tmpd" -maxdepth 2 -type f -name 'psiphon-tunnel-core*' ! -name '*.tar.gz' ! -name '*.sha256' | head -n1)"
-    fi
-
-    if [[ -z "$extracted" || ! -f "$extracted" ]]; then
-      red "[!] 解压后未找到 psiphon-tunnel-core 可执行文件"
-      exit 1
-    fi
-
-    install -m 0755 "$extracted" /usr/local/bin/psiphon-tunnel-core
+  # 尝试从自定义 repo 下载
+  if curl -fsSL --max-time 10 "$url" -o "${_tmpd}/${asset}" 2>/dev/null; then
     download_success=true
-    grn "[+] Psiphon 已从 hxzlplp7 releases 安装"
-
-  else
-    ylw "[!] 你的 releases 暂无 ${os}/${arch} 资产"
   fi
 
-  # Fallback 到官方二进制（仅 linux/amd64）
-  if [[ "$download_success" != "true" ]]; then
-    if [[ "$os" == "linux" && "$arch" == "amd64" ]]; then
-      ylw "[*] Fallback 到官方 psiphon-tunnel-core-binaries..."
-      ylw "[*] 下载: ${PSI_OFFICIAL_FALLBACK_LINUX_AMD64}"
-      download_file "$PSI_OFFICIAL_FALLBACK_LINUX_AMD64" /usr/local/bin/psiphon-tunnel-core
-      chmod +x /usr/local/bin/psiphon-tunnel-core
-      grn "[+] Psiphon（官方二进制）已安装"
+  if [[ "$download_success" == "true" ]]; then
+    if tar -xzf "${_tmpd}/${asset}" -C "${_tmpd}" 2>/dev/null; then
+      local BIN
+      BIN="$(find "${_tmpd}" -maxdepth 2 -type f -name 'psiphon-tunnel-core*' ! -name '*.tar.gz' | head -n1)"
+      if [[ -n "$BIN" ]]; then
+        install -m 0755 "$BIN" /usr/local/bin/psiphon-tunnel-core
+      else
+        download_success=false
+      fi
     else
-      red "[!] 你的 releases 不包含该平台资产（${os}/${arch}），且无 fallback"
-      red "    请发布: psiphon-tunnel-core-${os}-${arch}.tar.gz"
-      exit 1
+      download_success=false
     fi
   fi
+
+  # Fallback to official binaries if x86_64
+  if [[ "$download_success" != "true" && "$arch" == "amd64" ]]; then
+    ylw "[*] 尝试从官方渠道获取 Psiphon 二进制..."
+    if curl -fsSL --max-time 30 "${PSI_OFFICIAL_FALLBACK_LINUX_AMD64}" -o /usr/local/bin/psiphon-tunnel-core; then
+      chmod 0755 /usr/local/bin/psiphon-tunnel-core
+      download_success=true
+    fi
+  fi
+
+  if [[ "$download_success" != "true" ]]; then
+    red "[-] 无法获取 Psiphon 二进制。请检查您的网络能否访问 GitHub。"
+    return 1
+  fi
+  grn "[+] Psiphon ConsoleClient 安装成功"
 
   # 写配置文件
   cat >/etc/psiphon/psiphon.config <<EOF
@@ -343,8 +283,17 @@ install_xray_vless_reality(){
   fi
 
   rm -rf /tmp/xray && mkdir -p /tmp/xray
-  download_file "$url" /tmp/xray/xray.zip
-  unzip -q /tmp/xray/xray.zip -d /tmp/xray
+  if [[ -z "$url" ]]; then
+    ylw "[!] 无法获取 Xray 最新版本，尝试直接下载当前稳定版本..."
+    url="https://github.com/XTLS/Xray-core/releases/download/v24.11.11/Xray-linux-64.zip"
+    [[ "$arch" == "arm64" ]] && url="https://github.com/XTLS/Xray-core/releases/download/v24.11.11/Xray-linux-arm64-v8a.zip"
+  fi
+
+  if ! download_file "$url" /tmp/xray/xray.zip; then
+    red "[-] Xray 下载失败，请检查网络。"
+    return 1
+  fi
+  unzip -q /tmp/xray/xray.zip -d /tmp/xray || { red "[-] Xray 解压失败"; return 1; }
 
   install -m 0755 /tmp/xray/xray /usr/local/bin/xray
   mkdir -p /usr/local/share/xray
@@ -503,7 +452,16 @@ install_hysteria2(){
     url="$(download_latest_github_release_asset "apernet/hysteria" "hysteria-linux-386$")"
   fi
 
-  download_file "$url" /usr/local/bin/hysteria
+  if [[ -z "$url" ]]; then
+    ylw "[!] 无法获取 Hysteria2 最新版本，尝试使用默认版本..."
+    url="https://github.com/apernet/hysteria/releases/download/app%2Fv2.6.0/hysteria-linux-amd64"
+    [[ "$arch" == "arm64" ]] && url="https://github.com/apernet/hysteria/releases/download/app%2Fv2.6.0/hysteria-linux-arm64"
+  fi
+
+  if ! download_file "$url" /usr/local/bin/hysteria; then
+    red "[-] Hysteria2 下载失败。"
+    return 1
+  fi
   chmod +x /usr/local/bin/hysteria
 
   local hy_pass obfs_pass
@@ -626,25 +584,17 @@ install_tuic_server(){
   fi
 
   if [[ -z "$url" ]]; then
-    ylw "[!] 未能获取 tuic-server，尝试备用方式..."
-    local api="https://api.github.com/repos/tuic-protocol/tuic/releases"
-    if command -v curl >/dev/null 2>&1; then
-      if [[ "$arch" == "amd64" ]]; then
-        url="$(curl -fsSL "$api" | jq -r '.[0].assets[].browser_download_url' | grep -E 'tuic-server-.*x86_64-unknown-linux-gnu$' | head -n1 || true)"
-      elif [[ "$arch" == "arm64" ]]; then
-        url="$(curl -fsSL "$api" | jq -r '.[0].assets[].browser_download_url' | grep -E 'tuic-server-.*aarch64-unknown-linux-gnu$' | head -n1 || true)"
-      fi
-    fi
+    ylw "[!] 无法获取 tuic-server 最新版本，尝试使用默认版本..."
+    url="https://github.com/tuic-protocol/tuic/releases/download/tuic-server-1.0.0/tuic-server-1.0.0-x86_64-unknown-linux-gnu"
+    [[ "$arch" == "arm64" ]] && url="https://github.com/tuic-protocol/tuic/releases/download/tuic-server-1.0.0/tuic-server-1.0.0-aarch64-unknown-linux-gnu"
   fi
 
-  if [[ -z "$url" ]]; then
-    ylw "[!] 跳过 TUIC 安装（未找到可用二进制）"
+  if ! download_file "$url" /usr/local/bin/tuic-server; then
+    red "[-] TUIC 下载失败，跳过 TUIC 安装。"
     TUIC_UUID=""
     TUIC_PASS=""
     return 0
   fi
-
-  download_file "$url" /usr/local/bin/tuic-server
   chmod +x /usr/local/bin/tuic-server
 
   local tuic_uuid="" tuic_pass=""
@@ -708,6 +658,198 @@ EOF
 
   TUIC_UUID="$tuic_uuid"
   TUIC_PASS="$tuic_pass"
+}
+
+# ========= sing-box AnyTLS =========
+install_sing_box_anytls(){
+  local arch
+  arch="$(detect_arch)"
+
+  ylw "[*] 安装 sing-box (AnyTLS)..."
+  
+  # 获取最新的 sing-box 版本 (1.12.0+)
+  local latest_version url
+  ylw "[*] 正在获取 sing-box 最新版本..."
+  latest_version="$(curl -fsSL --max-time 10 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r .tag_name | sed 's/^v//' || echo "")"
+  
+  if [[ -z "$latest_version" || "$latest_version" == "null" ]]; then
+      ylw "[!] 无法从 GitHub API 获取最新版本，尝试使用默认稳定版 v1.12.1"
+      latest_version="1.12.1"
+  fi
+  
+  url="https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${arch}.tar.gz"
+
+  local t_tmpd
+  t_tmpd="$(mktemp -d)"
+  ylw "[*] 正在下载 sing-box v${latest_version}..."
+  
+  local dl_asset="${t_tmpd}/sing-box.tar.gz"
+  local dl_ok=0
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --max-time 30 "$url" -o "$dl_asset" && dl_ok=1
+  else
+    wget -qO "$dl_asset" "$url" --timeout=30 && dl_ok=1
+  fi
+
+  if [[ "$dl_ok" -ne 1 || ! -s "$dl_asset" ]]; then
+      red "[-] 错误：sing-box 下载失败。请检查网络连接或 GitHub 访问情况。"
+      rm -rf "$t_tmpd"
+      return 1
+  fi
+  
+  # 简易校验是否为 tar.gz
+  if ! file "$dl_asset" 2>/dev/null | grep -q "gzip"; then
+      if ! tar -tzf "$dl_asset" >/dev/null 2>&1; then
+          red "[-] 错误：下载的文件不是有效的压缩包，下载可能被拦截或损坏。"
+          rm -rf "$t_tmpd"
+          return 1
+      fi
+  fi
+
+  if ! tar -xzf "$dl_asset" -C "$t_tmpd"; then
+      red "[-] 错误：解压 sing-box 失败。"
+      rm -rf "$t_tmpd"
+      return 1
+  fi
+  
+  local extracted
+  extracted="$(find "$t_tmpd" -maxdepth 2 -type f -name 'sing-box' | head -n1)"
+  if [[ -z "$extracted" || ! -f "$extracted" ]]; then
+      red "[-] 错误：解压后未找到 sing-box 二进制文件。"
+      rm -rf "$t_tmpd"
+      return 1
+  fi
+  install -m 0755 "$extracted" /usr/local/bin/sing-box
+  rm -rf "$t_tmpd"
+  
+  mkdir -p /etc/sing-box
+  
+  # 生成配置
+  local uuid cert_path key_path
+  uuid="$(gen_uuid)"
+  
+  # 证书强制使用自签：对于 AnyTLS，为保证启动成功，默认使用自签。
+  # 用户若需 LE 证书，可手动修改或集成外部 ACME。
+  cert_path="/etc/ssl/sbox/self.crt"
+  key_path="/etc/ssl/sbox/self.key"
+
+  # 写入初始配置（默认直连）
+  cat > /etc/sing-box/config.json <<EOF
+{
+  "log": {"level": "warn"},
+  "inbounds": [{
+    "type": "anytls",
+    "tag": "anytls-in",
+    "listen": "::",
+    "listen_port": ${ANYTLS_PORT},
+    "users": [{"password": "${uuid}"}],
+    "tls": {
+      "enabled": true,
+      "certificate_path": "${cert_path}",
+      "key_path": "${key_path}"
+    }
+  }],
+  "outbounds": [{"type": "direct", "tag": "direct"}]
+}
+EOF
+
+  # 保存 UUID 以供后续使用
+  ANYTLS_UUID="$uuid"
+
+  # 应用初始出口模式
+  anytls_apply_mode "$EGRESS_MODE"
+
+  cat > /etc/systemd/system/sing-box.service <<EOF
+[Unit]
+Description=sing-box service (AnyTLS)
+After=network.target nss-lookup.target
+
+[Service]
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+Restart=always
+RestartSec=5
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now sing-box
+  grn "[+] sing-box (AnyTLS) 已启动"
+}
+
+anytls_apply_mode() {
+  local mode="$1"
+  local cfg="/etc/sing-box/config.json"
+  [[ -f "$cfg" ]] || return 0
+
+  # 从现有配置读取 UUID 和 证书路径
+  local uuid cert key port
+  uuid="$(jq -r '.inbounds[0].users[0].password // empty' "$cfg")"
+  cert="$(jq -r '.inbounds[0].tls.certificate_path // "/etc/ssl/sbox/self.crt"' "$cfg")"
+  key="$(jq -r '.inbounds[0].tls.key_path // "/etc/ssl/sbox/self.key"' "$cfg")"
+  port="$(jq -r '.inbounds[0].listen_port // 10443' "$cfg")"
+  
+  [[ -z "$uuid" ]] && return 0
+
+  local out_type="direct" out_tag="direct" ob_json='{"type":"direct","tag":"direct"}'
+  case "$mode" in
+    psiphon)
+      local socks
+      read -r socks _ < <(read_psi_ports)
+      out_tag="psiphon"
+      ob_json="{\"type\":\"socks\",\"tag\":\"psiphon\",\"server\":\"127.0.0.1\",\"server_port\":${socks}}"
+      ;;
+    freeproxy)
+      local fp_cfg="/etc/freeproxy/config.json"
+      local fp_ip fp_port fp_proto
+      fp_ip="$(jq -r '.current_proxy.ip // empty' "$fp_cfg" 2>/dev/null || echo "")"
+      fp_port="$(jq -r '.current_proxy.port // empty' "$fp_cfg" 2>/dev/null || echo "")"
+      fp_proto="$(jq -r '.current_proxy.protocol // empty' "$fp_cfg" 2>/dev/null || echo "")"
+      if [[ -n "$fp_ip" ]]; then
+        out_tag="freeproxy"
+        if [[ "$fp_proto" == "http" || "$fp_proto" == "https" ]]; then
+          ob_json="{\"type\":\"http\",\"tag\":\"freeproxy\",\"server\":\"${fp_ip}\",\"server_port\":${fp_port}}"
+        else
+          ob_json="{\"type\":\"socks\",\"tag\":\"freeproxy\",\"server\":\"${fp_ip}\",\"server_port\":${fp_port}}"
+        fi
+      fi
+      ;;
+  esac
+
+  cat > "$cfg" <<EOF
+{
+  "log": {"level": "warn"},
+  "inbounds": [{
+    "type": "anytls",
+    "tag": "anytls-in",
+    "listen": "::",
+    "listen_port": ${port},
+    "users": [{"password": "${uuid}"}],
+    "tls": {
+      "enabled": true,
+      "certificate_path": "${cert}",
+      "key_path": "${key}"
+    }
+  }],
+  "outbounds": [
+    ${ob_json},
+    {"type": "direct", "tag": "direct-out"}
+  ],
+  "route": {
+    "rules": [{"outbound": "${out_tag}"}]
+  }
+}
+EOF
+  systemctl restart sing-box 2>/dev/null || true
+  if [[ "$mode" != "direct" ]]; then
+     grn "[+] AnyTLS 出口已切换至: $mode"
+  else
+     echo "[+] AnyTLS (sing-box) 配置已更新 (direct)"
+  fi
 }
 
 # ========= psictl (Psiphon 管理工具) =========
@@ -1281,7 +1423,12 @@ apply_proxy() {
         ;;
     esac
     
-    local routing='{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"freeproxy","network":"tcp,udp"}]}'
+    local routing
+    if [[ "$protocol" == "http" || "$protocol" == "https" ]]; then
+       routing='{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"freeproxy","network":"tcp"}]}'
+    else
+       routing='{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"freeproxy","network":"tcp,udp"}]}'
+    fi
     tmp="$(mktemp)"
     jq --argjson ob "$outbound" --argjson rt "$routing" \
       '.outbounds=$ob | .routing=$rt' /etc/xray/config.json > "$tmp"
@@ -1303,6 +1450,12 @@ apply_proxy() {
       {if(!skip) print}
     ' /etc/hysteria/config.yaml > "$tmp2"
     
+    local routing
+    if [[ "$protocol" == "http" || "$protocol" == "https" ]]; then
+       routing="freeproxy(tcp)"
+    else
+       routing="freeproxy(all)"
+    fi
     case "$protocol" in
       socks5|socks4)
         cat >> "$tmp2" <<EOF
@@ -1315,7 +1468,7 @@ outbounds:
 
 acl:
   inline:
-    - freeproxy(all)
+    - ${routing}
 EOF
         ;;
       http|https)
@@ -1329,7 +1482,7 @@ outbounds:
 
 acl:
   inline:
-    - freeproxy(all)
+    - ${routing}
 EOF
         ;;
     esac
@@ -1339,6 +1492,11 @@ EOF
     grn "[+] Hysteria2 配置已更新"
   fi
   
+  # 更新 AnyTLS 配置
+  if [[ -f /etc/sing-box/config.json ]]; then
+    anytls_apply_mode "freeproxy"
+  fi
+
   write_cfg "enabled" "true"
   grn "[+] 代理已启用: $ip:$port ($protocol)"
 }
@@ -1499,6 +1657,11 @@ disable_proxy() {
     systemctl restart hysteria2 2>/dev/null || true
   fi
   
+  # 恢复 AnyTLS 直连
+  if [[ -f /etc/sing-box/config.json ]]; then
+    anytls_apply_mode "direct"
+  fi
+
   grn "[+] Free Proxy 已禁用，已恢复直连"
 }
 
@@ -1587,19 +1750,85 @@ EOF
 
 
 install_menu(){
-  ylw "[*] 安装菜单命令 vpsmenu (纯文本菜单)..."
-  
-  # 统一菜单：无论 direct/psiphon，都用同一份脚本
-  # 运行时根据 psictl 是否存在来决定功能可用性
-  # 支持 whiptail 美化（没装就降级文本版）
   cat > /usr/local/bin/vpsmenu <<'MENU_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-SERVICES_IN=("xray" "hysteria2" "tuic")
+SERVICES_IN=("xray" "hysteria2" "tuic" "sing-box")
 SERVICE_PSI="psiphon"
 CLIENT_JSON="/etc/psiphon-egress/client.json"
 PSI_CFG="/etc/psiphon/psiphon.config"
+
+anytls_apply_mode() {
+  local mode="$1"
+  local cfg="/etc/sing-box/config.json"
+  [[ -f "$cfg" ]] || return 0
+
+  # 从现有配置读取 UUID 和 证书路径
+  local uuid cert key port
+  uuid="$(jq -r '.inbounds[0].users[0].password // empty' "$cfg")"
+  cert="$(jq -r '.inbounds[0].tls.certificate_path // "/etc/ssl/sbox/self.crt"' "$cfg")"
+  key="$(jq -r '.inbounds[0].tls.key_path // "/etc/ssl/sbox/self.key"' "$cfg")"
+  port="$(jq -r '.inbounds[0].listen_port // 10443' "$cfg")"
+  
+  [[ -z "$uuid" || "$uuid" == "null" ]] && return 0
+
+  local out_tag="direct" ob_json='{"type":"direct","tag":"direct"}'
+  case "$mode" in
+    psiphon)
+      local socks
+      socks="$(jq -r '.LocalSocksProxyPort // 1081' "$PSI_CFG" 2>/dev/null || echo 1081)"
+      out_tag="psiphon"
+      ob_json="{\"type\":\"socks\",\"tag\":\"psiphon\",\"server\":\"127.0.0.1\",\"server_port\":${socks}}"
+      ;;
+    freeproxy)
+      local fp_cfg="/etc/freeproxy/config.json"
+      local fp_ip fp_port fp_proto
+      fp_ip="$(jq -r '.current_proxy.ip // empty' "$fp_cfg" 2>/dev/null || echo "")"
+      fp_port="$(jq -r '.current_proxy.port // empty' "$fp_cfg" 2>/dev/null || echo "")"
+      fp_proto="$(jq -r '.current_proxy.protocol // empty' "$fp_cfg" 2>/dev/null || echo "")"
+      if [[ -n "$fp_ip" ]]; then
+        out_tag="freeproxy"
+        if [[ "$fp_proto" == "http" || "$fp_proto" == "https" ]]; then
+          ob_json="{\"type\":\"http\",\"tag\":\"freeproxy\",\"server\":\"${fp_ip}\",\"server_port\":${fp_port}}"
+        else
+          ob_json="{\"type\":\"socks\",\"tag\":\"freeproxy\",\"server\":\"${fp_ip}\",\"server_port\":${fp_port}}"
+        fi
+      fi
+      ;;
+  esac
+
+  cat > "$cfg" <<EOF
+{
+  "log": {"level": "warn"},
+  "inbounds": [{
+    "type": "anytls",
+    "tag": "anytls-in",
+    "listen": "::",
+    "listen_port": ${port},
+    "users": [{"password": "${uuid}"}],
+    "tls": {
+      "enabled": true,
+      "certificate_path": "${cert}",
+      "key_path": "${key}"
+    }
+  }],
+  "outbounds": [
+    ${ob_json},
+    {"type": "direct", "tag": "direct-out"}
+  ],
+  "route": {
+    "rules": [{"outbound": "${out_tag}"}]
+  }
+}
+EOF
+  systemctl restart sing-box 2>/dev/null || true
+  if [[ "$mode" != "direct" ]]; then
+     echo "[+] AnyTLS 出口已应用: $mode"
+  else
+     echo "[+] AnyTLS (sing-box) 配置已更新 (direct)"
+  fi
+}
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 is_root() { [[ ${EUID:-$(id -u)} -eq 0 ]]; }
@@ -1694,6 +1923,11 @@ view_links() {
     t_pass="$(jq -r '.tuic.password // empty' "$CLIENT_JSON")"
     t_sni="$(jq -r '.tuic.sni // "www.bing.com"' "$CLIENT_JSON")"
 
+    local a_port a_pass a_sni
+    a_port="$(jq -r '.anytls.port // empty' "$CLIENT_JSON")"
+    a_pass="$(jq -r '.anytls.password // empty' "$CLIENT_JSON")"
+    a_sni="$(jq -r '.anytls.sni // "www.bing.com"' "$CLIENT_JSON")"
+
     echo ""
     echo "==================== 分享链接 ===================="
     echo ""
@@ -1738,19 +1972,20 @@ status_all() {
 }
 
 logs_menu() {
-  echo "可选：xray | hy2 | tuic | psi | all"
+  echo "可选：xray | hy2 | tuic | sb | psi | all"
   read -r -p "选择(默认 all): " s
   s="${s:-all}"
   case "$s" in
     xray) journalctl -u xray -n 200 --no-pager ;;
     hy2|hysteria2) journalctl -u hysteria2 -n 200 --no-pager ;;
     tuic) journalctl -u tuic -n 200 --no-pager ;;
+    sb|anytls|sing-box) journalctl -u sing-box -n 200 --no-pager ;;
     psi|psiphon)
       if have_cmd psictl; then psictl logs psi; else journalctl -u psiphon -n 200 --no-pager; fi
       ;;
     all|"")
       if have_cmd psictl; then psictl logs; else
-        for u in xray hysteria2 tuic psiphon; do
+        for u in xray hysteria2 tuic sing-box psiphon; do
           echo -e "\n===== $u ====="
           journalctl -u "$u" -n 120 --no-pager 2>/dev/null || echo "$u 未运行"
         done
@@ -1761,10 +1996,10 @@ logs_menu() {
 }
 
 psi_guard() {
-  if ! have_cmd psictl; then
+  if ! have_cmd psictl || [[ ! -f /usr/local/bin/psiphon-tunnel-core ]]; then
     echo ""
     echo "╔══════════════════════════════════════════════════════╗"
-    echo "║  未检测到 psictl（Psiphon 组件未安装）               ║"
+    echo "║  未检测到 psictl 或 Psiphon 二进制组件               ║"
     echo "║  请先选择 'A' 安装 Psiphon 组件                      ║"
     echo "╚══════════════════════════════════════════════════════╝"
     return 1
@@ -1788,6 +2023,7 @@ psi_smart_country() { psi_guard || return 0; psictl smart-country; }
 
 # ==================== 新增：出口 IP 检测 & 模式切换 ====================
 read_psi_ports() {
+  local PSI_CFG="/etc/psiphon/psiphon.config"
   local socks http
   socks="$(jq -r '.LocalSocksProxyPort // 1081' "$PSI_CFG" 2>/dev/null || echo 1081)"
   http="$(jq -r '.LocalHttpProxyPort // 8081' "$PSI_CFG" 2>/dev/null || echo 8081)"
@@ -1846,12 +2082,12 @@ xray_apply_mode() {
   read -r socks _ < <(read_psi_ports)
 
   local outbounds routing sniffing
+  sniffing='{"enabled":true,"destOverride":["http","tls"]}'
 
   case "$mode" in
     direct)
       outbounds='[{"protocol":"freedom","tag":"direct","settings":{}}]'
       routing='{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"direct","network":"tcp,udp"}]}'
-      sniffing='{"enabled":true,"destOverride":["http","tls"]}'
       ;;
     psiphon)
       # 全局 Psiphon: TCP+UDP 都走 Psiphon socks5
@@ -1859,7 +2095,26 @@ xray_apply_mode() {
         {"protocol":"socks","tag":"psiphon","settings":{"servers":[{"address":"127.0.0.1","port":'"$socks"'}]}}
       ]'
       routing='{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"psiphon","network":"tcp,udp"}]}'
-      sniffing='{"enabled":true,"destOverride":["http","tls"]}'
+      ;;
+    freeproxy)
+      local fp_cfg="/etc/freeproxy/config.json"
+      local fp_ip fp_port fp_proto
+      fp_ip="$(jq -r '.current_proxy.ip // empty' "$fp_cfg" 2>/dev/null || echo "")"
+      fp_port="$(jq -r '.current_proxy.port // empty' "$fp_cfg" 2>/dev/null || echo "")"
+      fp_proto="$(jq -r '.current_proxy.protocol // empty' "$fp_cfg" 2>/dev/null || echo "")"
+      if [[ -n "$fp_ip" ]]; then
+        if [[ "$fp_proto" == "http" || "$fp_proto" == "https" ]]; then
+          outbounds='[{"protocol":"http","tag":"freeproxy","settings":{"servers":[{"address":"'"$fp_ip"'","port":'"$fp_port"'}]}}]'
+          routing='{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"freeproxy","network":"tcp"}]}'
+        else
+          outbounds='[{"protocol":"socks","tag":"freeproxy","settings":{"servers":[{"address":"'"$fp_ip"'","port":'"$fp_port"'}]}}]'
+          routing='{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"freeproxy","network":"tcp,udp"}]}'
+        fi
+      else
+        # 无代理时 fallback 到直连
+        outbounds='[{"protocol":"freedom","tag":"direct","settings":{}}]'
+        routing='{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"direct","network":"tcp,udp"}]}'
+      fi
       ;;
     *)
       echo "[-] 未知 mode: $mode"; return 1 ;;
@@ -1915,6 +2170,45 @@ acl:
   inline:
     - psiphon(all)
 EOF
+      ;;
+    freeproxy)
+      local fp_cfg="/etc/freeproxy/config.json"
+      local fp_ip fp_port fp_proto
+      fp_ip="$(jq -r '.current_proxy.ip // empty' "$fp_cfg" 2>/dev/null || echo "")"
+      fp_port="$(jq -r '.current_proxy.port // empty' "$fp_cfg" 2>/dev/null || echo "")"
+      fp_proto="$(jq -r '.current_proxy.protocol // empty' "$fp_cfg" 2>/dev/null || echo "")"
+      if [[ -n "$fp_ip" ]]; then
+        local routing
+        if [[ "$fp_proto" == "http" || "$fp_proto" == "https" ]]; then
+           routing="freeproxy(tcp)"
+           cat >>"$tmp" <<EOF
+
+outbounds:
+  - name: freeproxy
+    type: http
+    http:
+      url: http://${fp_ip}:${fp_port}
+
+acl:
+  inline:
+    - ${routing}
+EOF
+        else
+           routing="freeproxy(all)"
+           cat >>"$tmp" <<EOF
+
+outbounds:
+  - name: freeproxy
+    type: socks5
+    socks5:
+      addr: ${fp_ip}:${fp_port}
+
+acl:
+  inline:
+    - ${routing}
+EOF
+        fi
+      fi
       ;;
   esac
 
@@ -2017,6 +2311,12 @@ switch_egress_mode() {
 
   set_client_mode "$mode"
   
+  # 调用出口应用函数（所有模式都调，函数内自判）
+  xray_apply_mode "$mode"
+  hy2_apply_mode "$mode"
+  anytls_apply_mode "$mode"
+  rewrite_units_by_mode "$mode"
+
   if [[ "$mode" == "freeproxy" ]]; then
     # freeproxy 模式：检查是否有配置好的代理
     local fp_enabled
@@ -2031,23 +2331,17 @@ switch_egress_mode() {
     # 启动健康检查定时器
     systemctl enable --now freeproxy-health.timer 2>/dev/null || true
     systemctl stop psiphon 2>/dev/null || true
+  elif [[ "$mode" == "direct" ]]; then
+    systemctl stop psiphon 2>/dev/null || true
+    systemctl stop freeproxy-health.timer 2>/dev/null || true
+    echo "[*] psiphon.service 已停止"
   else
-    xray_apply_mode "$mode"
-    hy2_apply_mode "$mode"
-    rewrite_units_by_mode "$mode"
-
-    if [[ "$mode" == "direct" ]]; then
-      systemctl stop psiphon 2>/dev/null || true
-      systemctl stop freeproxy-health.timer 2>/dev/null || true
-      echo "[*] psiphon.service 已停止"
-    else
-      systemctl enable --now psiphon 2>/dev/null || systemctl start psiphon 2>/dev/null || true
-      systemctl stop freeproxy-health.timer 2>/dev/null || true
-      echo "[*] psiphon.service 已启动"
-    fi
-
-    systemctl restart xray hysteria2 2>/dev/null || true
+    systemctl enable --now psiphon 2>/dev/null || systemctl start psiphon 2>/dev/null || true
+    systemctl stop freeproxy-health.timer 2>/dev/null || true
+    echo "[*] psiphon.service 已启动"
   fi
+
+  systemctl restart xray hysteria2 sing-box 2>/dev/null || true
 
   echo ""
   echo "[+] 已切换为: $mode"
@@ -2064,10 +2358,10 @@ psi_logs() {
 
 # ==================== Free Proxy 菜单函数 ====================
 fp_guard() {
-  if ! have_cmd proxyctl; then
+  if ! have_cmd proxyctl || [[ ! -f /etc/freeproxy/config.json ]]; then
     echo ""
     echo "╔══════════════════════════════════════════════════════╗"
-    echo "║  未检测到 proxyctl（Free Proxy 组件未安装）          ║"
+    echo "║  未检测到 proxyctl 或 Free Proxy 配置文件            ║"
     echo "║  请先选择 'B' 安装 Free Proxy 组件                   ║"
     echo "╚══════════════════════════════════════════════════════╝"
     return 1
@@ -2366,7 +2660,8 @@ case "${1:-}" in
       xray) journalctl -u xray -n 200 --no-pager ;;
       hy2|hysteria) journalctl -u hysteria2 -n 200 --no-pager ;;
       tuic) journalctl -u tuic -n 200 --no-pager ;;
-      *) journalctl -u psiphon -u xray -u hysteria2 -u tuic -n 200 --no-pager ;;
+      anytls|sing-box) journalctl -u sing-box -n 200 --no-pager ;;
+      *) journalctl -u psiphon -u xray -u hysteria2 -u tuic -u sing-box -n 200 --no-pager ;;
     esac
     ;;
   links)
@@ -2388,6 +2683,12 @@ case "${1:-}" in
       t_port="$(jq -r '.tuic.port' "$f")"; t_pass="$(jq -r '.tuic.password' "$f")"; t_sni="$(jq -r '.tuic.sni // "www.bing.com"' "$f")"
       echo "[TUIC v5]"
       echo "tuic://${t_uuid}:${t_pass}@${host}:${t_port}?alpn=h3&udp_relay_mode=native&congestion_control=bbr&sni=${t_sni}&allow_insecure=${insecure}#TUIC-v5"
+    fi
+    a_pass="$(jq -r '.anytls.password // empty' "$f")"
+    if [[ -n "$a_pass" && "$a_pass" != "null" ]]; then
+      a_port="$(jq -r '.anytls.port' "$f")"; a_sni="$(jq -r '.anytls.sni // "www.bing.com"' "$f")"
+      echo "[AnyTLS]"
+      echo "anytls://${a_pass}@${host}:${a_port}?sni=${a_sni}&allowInsecure=${insecure}#AnyTLS"
     fi
     echo "=================================================="
     ;;
@@ -2495,6 +2796,12 @@ save_client_json(){
     "alpn": "h3",
     "sni": "${QUIC_SNI}",
     "insecure": ${insecure}
+  },
+  "anytls": {
+    "port": ${ANYTLS_PORT},
+    "password": "${ANYTLS_UUID:-}",
+    "sni": "${QUIC_SNI}",
+    "insecure": ${insecure}
   }
 }
 EOF
@@ -2567,6 +2874,18 @@ ${tuic_link}
 EOF
   fi
 
+  local anytls_link="anytls://${ANYTLS_UUID}@${HOST}:${ANYTLS_PORT}?sni=${QUIC_SNI}&allowInsecure=${insecure}#AnyTLS"
+  cat <<EOF
+[AnyTLS]
+  地址: ${HOST}
+  端口: ${ANYTLS_PORT} (TCP/TLS)
+  密码: ${ANYTLS_UUID}
+
+[AnyTLS 分享链接]
+${anytls_link}
+
+EOF
+
   cat <<EOF
 ===============================================================
 
@@ -2597,8 +2916,19 @@ EOF
 
 # ========= main =========
 main(){
-  local arch
+  local arch os
+  os="$(detect_os)"
+  if [[ "$os" != "linux" ]]; then
+    red "[-] 错误：本脚本仅支持 Linux 系统。当前系统: $os"
+    exit 1
+  fi
+
   arch="$(detect_arch)"
+  if [[ "$arch" == "unknown" ]]; then
+    red "[-] 错误：不支持的 CPU 架构。"
+    exit 1
+  fi
+
   install_deps
 
   # 自动探测公网 IP（IPv4 优先）
@@ -2623,6 +2953,7 @@ main(){
   prompt VLESS_PORT "VLESS+REALITY 端口(TCP)" "$DEFAULT_VLESS_PORT"
   prompt HY2_PORT "Hysteria2 端口(UDP)" "$DEFAULT_HY2_PORT"
   prompt TUIC_PORT "TUIC v5 端口(UDP)" "$DEFAULT_TUIC_PORT"
+  prompt ANYTLS_PORT "AnyTLS 端口(TCP)" "$DEFAULT_ANYTLS_PORT"
   prompt REALITY_SNI "REALITY 伪装站点(需TLS1.3/H2，示例 www.apple.com)" "$DEFAULT_REALITY_SNI"
   prompt QUIC_SNI "HY2/TUIC 伪装站点SNI" "$DEFAULT_QUIC_SNI"
   prompt CERT_MODE "HY2/TUIC TLS证书模式：le(自动申请) 或 self(自签)" "$DEFAULT_CERT_MODE"
@@ -2658,6 +2989,7 @@ main(){
   install_xray_vless_reality
   install_hysteria2
   install_tuic_server
+  install_sing_box_anytls
 
   # 始终安装 psictl 和 proxyctl 以便菜单使用
   install_psictl

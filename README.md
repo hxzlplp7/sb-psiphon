@@ -8,6 +8,7 @@
   - **VLESS + REALITY**（Xray-core）
   - **Hysteria2**（apernet/hysteria）
   - **TUIC v5**（EAimTY/tuic）
+  - **AnyTLS**（SagerNet/sing-box）
 
 - **出站模式**（三选一）：
   | 模式 | 说明 |
@@ -39,6 +40,7 @@
 │  │  Xray (VLESS+Reality)  :443 TCP                     │   │
 │  │  Hysteria2             :8443 UDP                    │   │
 │  │  TUIC                  :2053 UDP (固定直连)          │   │
+│  │  AnyTLS                :10443 TCP (sing-box)         │   │
 │  │                                                      │   │
 │  │  ↓ smart 模式：AI/流媒体→Psiphon，其余→直连 ↓       │   │
 │  └─────────────────────────┬───────────────────────────┘   │
@@ -56,7 +58,7 @@
 
 ## 适用系统
 
-- **发行版**：Debian / Ubuntu / Rocky / Alma / CentOS（需 systemd）
+- **发行版**：Debian / Ubuntu / Rocky / Alma / CentOS（需 systemd，仅限 Linux）
 - **架构**：
   - x86_64 / i686：直接下载官方预编译二进制
   - arm64 / arm：自动使用 Go 编译
@@ -128,6 +130,7 @@ psictl logs psi      # psiphon
 psictl logs xray     # xray
 psictl logs hy2      # hysteria2
 psictl logs tuic     # tuic
+psictl logs anytls   # anytls (sing-box)
 ```
 
 ## 支持的出口国家
@@ -157,6 +160,7 @@ Psiphon 支持以下国家（使用两位国家代码）：
 | Xray | `/etc/xray/config.json` |
 | Hysteria2 | `/etc/hysteria/config.yaml` |
 | TUIC | `/etc/tuic/config.json` |
+| AnyTLS (sing-box) | `/etc/sing-box/config.json` |
 | 自签证书 | `/etc/ssl/sbox/` |
 
 ## 客户端配置示例
@@ -185,16 +189,16 @@ OBFS密码: <安装时生成>
 （自签证书需要 skip-cert-verify / insecure=true）
 ```
 
-### TUIC v5
+（自签证书需要 skip-cert-verify / insecure=true）
+```
+
+### AnyTLS (sing-box)
 
 ```
 地址: <你的HOST>
-端口: 2053 (UDP)
+端口: 10443 (TCP)
 UUID: <安装时生成>
-密码: <安装时生成>
-Congestion: bbr
-ALPN: h3
-（自签证书需要 skip-cert-verify / insecure=true）
+（AnyTLS 模式强制使用自签证书，客户端需开启 skip-cert-verify）
 ```
 
 ## 常见问题
@@ -233,7 +237,7 @@ A:
 
 ### 1. 检查服务状态
 ```bash
-systemctl status psiphon xray hysteria2 tuic
+systemctl status psiphon xray hysteria2 tuic sing-box
 ```
 
 ### 2. 查看详细日志
@@ -247,7 +251,7 @@ psictl logs
 
 ### 3. 检查端口监听
 ```bash
-ss -lntup | grep -E '443|8443|2053|1081|8081'
+ss -lntup | grep -E '443|8443|2053|10443|1081|8081'
 ```
 
 ### 4. 常见问题及解决

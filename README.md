@@ -228,6 +228,17 @@ A:
 - `self`（默认）：自签证书，适用于任何 VPS，客户端需启用 `insecure=true`
 - `le`：Let's Encrypt 自动证书，需要域名且 80/443 端口可用
 
+### NAT VPS 稳定性建议
+
+针对内存较小（<512MB）或带宽严重受限的 NAT VPS，由于网络波动可能导致 SSH 断开并中断脚本执行，建议：
+
+1.  **先下载再运行**：避免使用 `bash <(curl ...)`。先将脚本保存到本地执行：
+    ```bash
+    wget -O install.sh https://raw.githubusercontent.com/hxzlplp7/sb-psiphon/main/install.sh && bash install.sh
+    ```
+2.  **使用 Screen/Tmux**：在不稳定的环境下，先开启 `screen` 或 `tmux` 运行脚本，确保即使 SSH 断开，安装过程也能在后台完成。
+3.  **开启 Swap**：脚本会自动检测内存。如果提示内存不足，建议确认开启 Swap（虚拟内存）以防 OOM 杀进程。
+
 ## 快速排障
 
 当服务不正常时，按以下步骤排查：

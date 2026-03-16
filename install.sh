@@ -127,6 +127,31 @@ install_deps(){
   fi
 }
 
+check_memory(){
+  local total_mem swap_total
+  total_mem=$(free -m | awk '/^Mem:/{print $2}')
+  swap_total=$(free -m | awk '/^Swap:/{print $2}')
+  
+  if [[ "$total_mem" -lt 512 ]] && [[ "$swap_total" -lt 100 ]]; then
+    echo ""
+    ylw "[!] 检测到您的 VPS 内存较小 ($total_mem MB) 且未开启 Swap。"
+    ylw "    对于低端 NAT VPS，建议开启 Swap 以防安装过程中因内存溢出 (OOM) 导致死机或断联。"
+    read -r -p "是否自动创建 512MB 的虚拟内存 (Swap)？[y/N]: " is_swap
+    if [[ "$is_swap" =~ ^[Yy]$ ]]; then
+      ylw "[*] 正在创建 Swap 文件..."
+      if fallocate -l 512M /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=512 2>/dev/null; then
+        chmod 600 /swapfile
+        mkswap /swapfile >/dev/null 2>&1
+        swapon /swapfile >/dev/null 2>&1
+        echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        grn "[+] Swap 开启成功 (512MB)"
+      else
+        red "[-] Swap 开启失败，请检查磁盘空间或权限。"
+      fi
+    fi
+  fi
+}
+
 prompt(){
   local var="$1" msg="$2" def="$3" val=""
   read -r -p "$msg (默认: $def): " val || true
@@ -146,6 +171,7 @@ download_file(){
   local url="$1" dest="$2"
   local tmp="/tmp/download_$(rand_hex 4)"
   ylw "[*] 正在下载: $url"
+  sleep 1  # 避开 NAT 瞬时高峰
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL --retry 3 --max-time 60 "$url" -o "$tmp" || { red "[-] 下载失败: $url"; return 1; }
   else
@@ -2930,6 +2956,7 @@ main(){
   fi
 
   install_deps
+  check_memory
 
   # 自动探测公网 IP（IPv4 优先）
   ylw "[*] 正在探测本机公网 IP (IPv4 优先)..."

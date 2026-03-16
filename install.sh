@@ -609,11 +609,6 @@ quic:
   maxStreamReceiveWindow: 16777216
   initConnReceiveWindow: 33554432
   maxConnReceiveWindow: 33554432
-masquerade:
-  type: proxy
-  proxy:
-    url: https://maimai.sega.jp
-    rewriteHost: true
 EOF
   else
     # 自签证书模式 - 基础配置
@@ -631,11 +626,6 @@ quic:
   maxStreamReceiveWindow: 16777216
   initConnReceiveWindow: 33554432
   maxConnReceiveWindow: 33554432
-masquerade:
-  type: proxy
-  proxy:
-    url: https://maimai.sega.jp
-    rewriteHost: true
 EOF
   fi
 
@@ -808,14 +798,22 @@ install_sing_box_anytls(){
   # 获取最新的 sing-box 版本 (1.12.0+)
   local latest_version url
   ylw "[*] 正在获取 sing-box 最新版本..."
-  latest_version="$(curl -fsSL --max-time 10 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r .tag_name | sed 's/^v//' || echo "")"
+  latest_version="$(curl -fsSL --max-time 15 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' | sed 's/^v//' || true)"
 
   if [[ -z "$latest_version" || "$latest_version" == "null" ]]; then
-      ylw "[!] 无法从 GitHub API 获取最新版本，尝试使用默认稳定版 v1.12.1"
+      # 尝试备用 API 地址
+      latest_version="$(curl -fsSL --max-time 15 "https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box" 2>/dev/null | jq -r '.versions[0] // empty' | sed 's/^v//' || true)"
+  fi
+
+  if [[ -z "$latest_version" || "$latest_version" == "null" ]]; then
+      ylw "[!] 无法从 GitHub API 获取最新版本，使用默认稳定版 v1.12.1"
       latest_version="1.12.1"
   fi
 
+  ylw "[*] sing-box 版本: v${latest_version}"
   url="https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${arch}.tar.gz"
+  # ghproxy 加速 CDN（防止 GitHub 直连卡顿）
+  local url_cdn="https://ghproxy.net/${url}"
 
   local t_tmpd
   t_tmpd="$(mktemp -d)"
@@ -823,10 +821,12 @@ install_sing_box_anytls(){
 
   local dl_asset="${t_tmpd}/sing-box.tar.gz"
   local dl_ok=0
-  if command -v curl >/dev/null 2>&1; then
-    curl -fL --progress-bar --max-time 30 "$url" -o "$dl_asset" && dl_ok=1
-  else
-    wget -O "$dl_asset" "$url" --timeout=30 --progress=bar:force:noscroll && dl_ok=1
+  # 先尝试 CDN 加速下载，失败则尝试直连 GitHub
+  ylw "[*] 正在下载 sing-box (CDN -> GitHub 双保険)..."
+  if curl -fL --progress-bar --max-time 60 "$url_cdn" -o "$dl_asset" 2>/dev/null && [[ -s "$dl_asset" ]]; then
+    dl_ok=1
+  elif curl -fL --progress-bar --max-time 90 "$url" -o "$dl_asset" 2>/dev/null && [[ -s "$dl_asset" ]]; then
+    dl_ok=1
   fi
 
   if [[ "$dl_ok" -ne 1 || ! -s "$dl_asset" ]]; then

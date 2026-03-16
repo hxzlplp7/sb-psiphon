@@ -22,6 +22,7 @@ systemctl disable --now tuic 2>/dev/null || true
 # 兼容旧版本
 systemctl disable --now warp-plus 2>/dev/null || true
 systemctl disable --now sing-box 2>/dev/null || true
+systemctl disable --now anytls 2>/dev/null || true
 
 ylw "[*] 删除 systemd 服务文件..."
 rm -f /etc/systemd/system/psiphon.service

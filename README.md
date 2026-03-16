@@ -189,9 +189,6 @@ OBFS密码: <安装时生成>
 （自签证书需要 skip-cert-verify / insecure=true）
 ```
 
-（自签证书需要 skip-cert-verify / insecure=true）
-```
-
 ### AnyTLS (sing-box)
 
 ```
